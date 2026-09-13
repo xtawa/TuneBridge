@@ -46,6 +46,7 @@ func (f *fakeSource) UserProfile(context.Context) (source.UserProfile, error) {
 	return source.UserProfile{}, nil
 }
 func (f *fakeSource) LikedTracks(context.Context) ([]model.Track, error)   { return nil, nil }
+func (f *fakeSource) LikeTrack(context.Context, string, bool) error        { return nil }
 func (f *fakeSource) Playlists(context.Context) ([]source.Playlist, error) { return nil, nil }
 func (f *fakeSource) Playlist(context.Context, string) (source.Playlist, []model.Track, error) {
 	return source.Playlist{}, nil, nil

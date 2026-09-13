@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +31,10 @@ const (
 	searchRoot    = neteaseRoot + "/搜索结果"
 )
 
+type ArtworkService interface {
+	Serve(ctx context.Context, w http.ResponseWriter, id model.TrackIdentity) error
+}
+
 // VirtualLibrary turns provider metadata into a read-only, stable DAV tree.
 // Snapshot keys are category identities rather than display names; a path is
 // just a generated view and never a database/source identity.
@@ -36,6 +42,7 @@ type VirtualLibrary struct {
 	source                source.MusicSource
 	proxy                 *stream.Proxy
 	search                SearchResults
+	artwork               ArtworkService
 	playlistTTL, dailyTTL time.Duration
 	lyricsMode            string
 
@@ -59,7 +66,7 @@ type cachedLyrics struct {
 	expires    time.Time
 }
 
-func NewVirtualLibrary(src source.MusicSource, proxy *stream.Proxy, searchResults SearchResults, playlistTTL, dailyTTL time.Duration, lyricsMode string) (*VirtualLibrary, error) {
+func NewVirtualLibrary(src source.MusicSource, proxy *stream.Proxy, searchResults SearchResults, playlistTTL, dailyTTL time.Duration, lyricsMode string, artwork ArtworkService) (*VirtualLibrary, error) {
 	if src == nil || proxy == nil {
 		return nil, errors.New("virtual library requires source and stream proxy")
 	}
@@ -69,7 +76,7 @@ func NewVirtualLibrary(src source.MusicSource, proxy *stream.Proxy, searchResult
 	if lyricsMode != "original" && lyricsMode != "original_translation" && lyricsMode != "original_romanized" {
 		return nil, errors.New("unsupported lyrics mode")
 	}
-	return &VirtualLibrary{source: src, proxy: proxy, search: searchResults, playlistTTL: playlistTTL, dailyTTL: dailyTTL, lyricsMode: lyricsMode, snapshots: make(map[string]snapshot), lyrics: make(map[string]cachedLyrics)}, nil
+	return &VirtualLibrary{source: src, proxy: proxy, search: searchResults, artwork: artwork, playlistTTL: playlistTTL, dailyTTL: dailyTTL, lyricsMode: lyricsMode, snapshots: make(map[string]snapshot), lyrics: make(map[string]cachedLyrics)}, nil
 }
 
 func (l *VirtualLibrary) Stat(ctx context.Context, resourcePath string) (webdav.Resource, error) {
@@ -85,10 +92,20 @@ func (l *VirtualLibrary) Stat(ctx context.Context, resourcePath string) (webdav.
 				return webdav.Resource{}, err
 			}
 			resource, ok := s.resources[resourcePath]
-			if !ok {
-				return webdav.Resource{}, webdav.ErrNotFound
+			if ok {
+				return resource, nil
 			}
-			return resource, nil
+			ext := strings.ToLower(path.Ext(resourcePath))
+			if ext == ".jpg" || ext == ".png" || ext == ".jpeg" {
+				targetDir := strings.TrimSuffix(resourcePath, path.Ext(resourcePath))
+				if ps, err := l.playlistSnapshot(ctx, targetDir); err == nil {
+					if res, ok := ps.resources[targetDir+"/cover.jpg"]; ok {
+						res.Path = resourcePath
+						return res, nil
+					}
+				}
+			}
+			return webdav.Resource{}, webdav.ErrNotFound
 		}
 		playlistPath := parent
 		if strings.HasSuffix(resourcePath, ".lrc") {
@@ -97,24 +114,38 @@ func (l *VirtualLibrary) Stat(ctx context.Context, resourcePath string) (webdav.
 		if s, err := l.playlistSnapshot(ctx, playlistPath); err == nil {
 			if resource, ok := s.resources[resourcePath]; ok {
 				return resource, nil
-			} else {
-				return webdav.Resource{}, webdav.ErrNotFound
 			}
+			if resource, ok := findFallbackCover(s, resourcePath); ok {
+				return resource, nil
+			}
+			return webdav.Resource{}, webdav.ErrNotFound
 		} else {
 			return webdav.Resource{}, err
 		}
 	}
 	for _, root := range []string{likedRoot, dailyRoot, searchRoot} {
+		if resourcePath == root+".jpg" || resourcePath == root+".png" || resourcePath == root+".jpeg" {
+			s, err := l.trackSnapshot(ctx, root)
+			if err != nil {
+				return webdav.Resource{}, err
+			}
+			if res, ok := s.resources[root+"/cover.jpg"]; ok {
+				res.Path = resourcePath
+				return res, nil
+			}
+		}
 		if strings.HasPrefix(resourcePath, root+"/") {
 			s, err := l.trackSnapshot(ctx, root)
 			if err != nil {
 				return webdav.Resource{}, err
 			}
-			resource, ok := s.resources[resourcePath]
-			if !ok {
-				return webdav.Resource{}, webdav.ErrNotFound
+			if resource, ok := s.resources[resourcePath]; ok {
+				return resource, nil
 			}
-			return resource, nil
+			if resource, ok := findFallbackCover(s, resourcePath); ok {
+				return resource, nil
+			}
+			return webdav.Resource{}, webdav.ErrNotFound
 		}
 	}
 	return webdav.Resource{}, webdav.ErrNotFound
@@ -176,6 +207,9 @@ func (l *VirtualLibrary) Head(ctx context.Context, resource webdav.Resource) (we
 		}
 		resource.Size, resource.ETag = int64(len([]byte(body))), etag
 	}
+	if resource.Kind == webdav.CoverFile {
+		resource.ContentType = "image/jpeg"
+	}
 	return resource, nil
 }
 
@@ -201,6 +235,20 @@ func (l *VirtualLibrary) Get(ctx context.Context, w http.ResponseWriter, r *http
 		w.Header().Set("Cache-Control", "private, max-age=300")
 		_, err = w.Write([]byte(body))
 		return err
+	case webdav.CoverFile:
+		if l.artwork == nil {
+			return errors.New("artwork service is not configured")
+		}
+		err := l.artwork.Serve(ctx, w, resource.Track)
+		if errors.Is(err, os.ErrNotExist) {
+			http.NotFound(w, r)
+			return nil
+		}
+		if err != nil {
+			http.Error(w, "artwork is unavailable", http.StatusBadGateway)
+			return nil
+		}
+		return nil
 	default:
 		return errors.New("unsupported virtual file")
 	}
@@ -402,12 +450,20 @@ func (l *VirtualLibrary) makeTrackSnapshot(ctx context.Context, directory string
 			size = -1
 		}
 
+		modTime := track.UpdatedAt
+		if modTime.IsZero() {
+			modTime = time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		}
+		etagHash := sha256.Sum256([]byte(track.Identity.String() + ":" + strconv.FormatInt(size, 10) + ":" + ext))
+		etag := `"` + hex.EncodeToString(etagHash[:16]) + `"`
+
 		audio := webdav.Resource{
 			Path:        directory + "/" + filename,
 			Kind:        webdav.AudioFile,
 			ContentType: cType,
 			Size:        size,
-			ModifiedAt:  track.UpdatedAt,
+			ETag:        etag,
+			ModifiedAt:  modTime,
 			Track:       track.Identity,
 		}
 		lyrics := webdav.Resource{
@@ -415,16 +471,80 @@ func (l *VirtualLibrary) makeTrackSnapshot(ctx context.Context, directory string
 			Kind:        webdav.LyricsFile,
 			ContentType: "text/plain; charset=utf-8",
 			Size:        -1,
-			ModifiedAt:  track.UpdatedAt,
+			ModifiedAt:  modTime,
+			Track:       track.Identity,
+		}
+		cover := webdav.Resource{
+			Path:        directory + "/" + CoverFilename(filename),
+			Kind:        webdav.CoverFile,
+			ContentType: "image/jpeg",
+			Size:        -1,
+			ModifiedAt:  modTime,
 			Track:       track.Identity,
 		}
 		s.resources[audio.Path] = audio
 		s.resources[lyrics.Path] = lyrics
-		s.children[directory] = append(s.children[directory], audio, lyrics)
+		s.resources[cover.Path] = cover
+		s.children[directory] = append(s.children[directory], audio, lyrics, cover)
+	}
+
+	if len(sorted) > 0 {
+		firstTrack := sorted[0]
+		modTime := firstTrack.UpdatedAt
+		if modTime.IsZero() {
+			modTime = time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		}
+		coverPath := directory + "/cover.jpg"
+		if _, exists := s.resources[coverPath]; !exists {
+			coverJpg := webdav.Resource{
+				Path:        coverPath,
+				Kind:        webdav.CoverFile,
+				ContentType: "image/jpeg",
+				Size:        -1,
+				ModifiedAt:  modTime,
+				Track:       firstTrack.Identity,
+			}
+			s.resources[coverPath] = coverJpg
+			s.children[directory] = append(s.children[directory], coverJpg)
+		}
+		folderPath := directory + "/folder.jpg"
+		if _, exists := s.resources[folderPath]; !exists {
+			folderJpg := webdav.Resource{
+				Path:        folderPath,
+				Kind:        webdav.CoverFile,
+				ContentType: "image/jpeg",
+				Size:        -1,
+				ModifiedAt:  modTime,
+				Track:       firstTrack.Identity,
+			}
+			s.resources[folderPath] = folderJpg
+			s.children[directory] = append(s.children[directory], folderJpg)
+		}
 	}
 
 	sortResources(s.children[directory])
 	return s, nil
+}
+
+func findFallbackCover(s snapshot, resourcePath string) (webdav.Resource, bool) {
+	dir, file := path.Split(resourcePath)
+	dir = strings.TrimSuffix(dir, "/")
+	lowerFile := strings.ToLower(file)
+	if lowerFile == "cover.jpg" || lowerFile == "folder.jpg" || lowerFile == "cover.png" || lowerFile == "folder.png" || lowerFile == "cover.jpeg" || lowerFile == "folder.jpeg" {
+		if res, ok := s.resources[dir+"/cover.jpg"]; ok {
+			res.Path = resourcePath
+			return res, true
+		}
+	}
+	ext := strings.ToLower(path.Ext(resourcePath))
+	if ext == ".png" || ext == ".jpeg" {
+		base := strings.TrimSuffix(resourcePath, path.Ext(resourcePath))
+		if res, ok := s.resources[base+".jpg"]; ok {
+			res.Path = resourcePath
+			return res, true
+		}
+	}
+	return webdav.Resource{}, false
 }
 
 func contentTypeFromExtension(ext string) string {
@@ -498,6 +618,11 @@ func (l *VirtualLibrary) store(key string, s snapshot, ttl time.Duration) {
 func (l *VirtualLibrary) InvalidateSearch() {
 	l.mu.Lock()
 	delete(l.snapshots, "tracks:"+searchRoot)
+	l.mu.Unlock()
+}
+func (l *VirtualLibrary) InvalidateLiked() {
+	l.mu.Lock()
+	delete(l.snapshots, "tracks:"+likedRoot)
 	l.mu.Unlock()
 }
 func cloneResources(items []webdav.Resource) []webdav.Resource {

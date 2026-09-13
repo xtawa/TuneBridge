@@ -2,8 +2,11 @@ package library
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -33,6 +36,9 @@ func (u unauthedSource) UserProfile(context.Context) (source.UserProfile, error)
 }
 func (u unauthedSource) LikedTracks(context.Context) ([]model.Track, error) {
 	return nil, netease.ErrUnauthenticated
+}
+func (u unauthedSource) LikeTrack(context.Context, string, bool) error {
+	return netease.ErrUnauthenticated
 }
 func (u unauthedSource) Playlists(context.Context) ([]source.Playlist, error) {
 	return nil, netease.ErrUnauthenticated
@@ -83,7 +89,7 @@ func TestVirtualLibrary_UnauthenticatedReturnsEmptyListWithoutError(t *testing.T
 		t.Fatal(err)
 	}
 
-	vl, err := NewVirtualLibrary(src, proxy, nil, time.Minute, time.Minute, "original")
+	vl, err := NewVirtualLibrary(src, proxy, nil, time.Minute, time.Minute, "original", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +190,7 @@ func TestVirtualLibrary_LazyStreamResolution_ZeroCallsOnList(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	vl, err := NewVirtualLibrary(src, proxy, nil, time.Minute, time.Minute, "original")
+	vl, err := NewVirtualLibrary(src, proxy, nil, time.Minute, time.Minute, "original", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,9 +201,9 @@ func TestVirtualLibrary_LazyStreamResolution_ZeroCallsOnList(t *testing.T) {
 		t.Fatalf("List failed: %v", err)
 	}
 
-	// 50 audio tracks + 50 lyrics files = 100 items
-	if len(items) != 100 {
-		t.Fatalf("expected 100 items, got: %d", len(items))
+	// 50 audio tracks + 50 lyrics files + 50 cover files + 2 folder covers (cover.jpg, folder.jpg) = 152 items
+	if len(items) != 152 {
+		t.Fatalf("expected 152 items, got: %d", len(items))
 	}
 
 	if calls := src.resolveCallCount.Load(); calls != 0 {
@@ -276,7 +282,7 @@ func TestVirtualLibrary_SingleflightSnapshot_ConcurrentProbes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	vl, err := NewVirtualLibrary(src, proxy, nil, time.Minute, time.Minute, "original")
+	vl, err := NewVirtualLibrary(src, proxy, nil, time.Minute, time.Minute, "original", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,8 +300,8 @@ func TestVirtualLibrary_SingleflightSnapshot_ConcurrentProbes(t *testing.T) {
 				errCh <- err
 				return
 			}
-			if len(items) != 2 { // 1 audio + 1 lrc
-				errCh <- fmt.Errorf("expected 2 items, got %d", len(items))
+			if len(items) != 5 { // 1 audio + 1 lrc + 1 cover + 2 directory covers (cover.jpg, folder.jpg)
+				errCh <- fmt.Errorf("expected 5 items, got %d", len(items))
 			}
 		}()
 	}
@@ -312,5 +318,142 @@ func TestVirtualLibrary_SingleflightSnapshot_ConcurrentProbes(t *testing.T) {
 	// Singleflight guarantees LikedTracks was called only once despite 10 concurrent requests
 	if calls := src.likedCallCount.Load(); calls != 1 {
 		t.Fatalf("expected exactly 1 LikedTracks call with singleflight, got: %d", calls)
+	}
+}
+
+type fakeArtworkService struct {
+	serveFn func(ctx context.Context, w http.ResponseWriter, id model.TrackIdentity) error
+}
+
+func (f *fakeArtworkService) Serve(ctx context.Context, w http.ResponseWriter, id model.TrackIdentity) error {
+	if f.serveFn != nil {
+		return f.serveFn(ctx, w, id)
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.WriteHeader(http.StatusOK)
+	_, err := w.Write([]byte("fake-jpeg-bytes"))
+	return err
+}
+
+func TestVirtualLibrary_ArtworkCover(t *testing.T) {
+	t.Parallel()
+
+	track := model.Track{
+		Identity:        model.TrackIdentity{SourceID: "netease", TrackID: "8888"},
+		Title:           "Test Song",
+		Artists:         []string{"Test Artist"},
+		EstimatedFormat: model.AudioFormat{Extension: "mp3", ContentType: "audio/mpeg", Codec: "mp3", BitrateKbps: 320},
+		EstimatedSize:   1000000,
+	}
+
+	src := &fakeTrackSource{
+		likedTracksFn: func(ctx context.Context) ([]model.Track, error) {
+			return []model.Track{track}, nil
+		},
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "tunebridge.db")
+	db, err := database.Open(dbPath)
+	if err != nil {
+		t.Fatalf("database.Open failed: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	cacheDir := t.TempDir()
+	audioCache, err := cache.NewAudioManager(db, cacheDir, 10*1024*1024)
+	if err != nil {
+		t.Fatalf("cache.NewAudioManager failed: %v", err)
+	}
+
+	proxy, err := stream.NewProxy(src, source.QualityStandard, http.DefaultClient, audioCache)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mockArtwork := &fakeArtworkService{}
+	vl, err := NewVirtualLibrary(src, proxy, nil, time.Minute, time.Minute, "original", mockArtwork)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	// 1. Stat track cover sidecar (.jpg)
+	coverPath := likedRoot + "/Test Song - Test Artist.jpg"
+	res, err := vl.Stat(ctx, coverPath)
+	if err != nil {
+		t.Fatalf("expected track cover .jpg to exist, got error: %v", err)
+	}
+	if res.Kind != webdav.CoverFile {
+		t.Fatalf("expected Kind == CoverFile, got: %v", res.Kind)
+	}
+	if res.Track != track.Identity {
+		t.Fatalf("expected Track == %v, got: %v", track.Identity, res.Track)
+	}
+
+	// 2. Head on CoverFile
+	headRes, err := vl.Head(ctx, res)
+	if err != nil {
+		t.Fatalf("Head on CoverFile failed: %v", err)
+	}
+	if headRes.ContentType != "image/jpeg" {
+		t.Fatalf("expected ContentType == image/jpeg, got: %s", headRes.ContentType)
+	}
+
+	// 3. Get on CoverFile
+	req := httptest.NewRequest(http.MethodGet, (&url.URL{Path: coverPath}).EscapedPath(), nil)
+	rec := httptest.NewRecorder()
+	err = vl.Get(ctx, rec, req, res)
+	if err != nil {
+		t.Fatalf("Get on CoverFile failed: %v", err)
+	}
+	if rec.Header().Get("Content-Type") != "image/jpeg" {
+		t.Fatalf("expected header Content-Type image/jpeg, got: %s", rec.Header().Get("Content-Type"))
+	}
+	if rec.Body.String() != "fake-jpeg-bytes" {
+		t.Fatalf("unexpected body: %s", rec.Body.String())
+	}
+
+	// 4. Directory cover.jpg and folder.jpg
+	for _, p := range []string{likedRoot + "/cover.jpg", likedRoot + "/folder.jpg"} {
+		dirRes, err := vl.Stat(ctx, p)
+		if err != nil {
+			t.Fatalf("expected %s to exist, got: %v", p, err)
+		}
+		if dirRes.Kind != webdav.CoverFile {
+			t.Fatalf("expected Kind == CoverFile for %s, got: %v", p, dirRes.Kind)
+		}
+	}
+
+	// 5. Fallback cover (.png or casing)
+	pngRes, err := vl.Stat(ctx, likedRoot+"/Test Song - Test Artist.png")
+	if err != nil {
+		t.Fatalf("expected .png fallback to resolve to cover, got: %v", err)
+	}
+	if pngRes.Kind != webdav.CoverFile {
+		t.Fatalf("expected Kind == CoverFile for .png fallback, got: %v", pngRes.Kind)
+	}
+
+	caseRes, err := vl.Stat(ctx, likedRoot+"/Folder.JPG")
+	if err != nil {
+		t.Fatalf("expected Folder.JPG fallback to resolve, got: %v", err)
+	}
+	if caseRes.Kind != webdav.CoverFile {
+		t.Fatalf("expected Kind == CoverFile for Folder.JPG fallback, got: %v", caseRes.Kind)
+	}
+
+	// 6. Root collection cover
+	rootCoverRes, err := vl.Stat(ctx, likedRoot+".jpg")
+	if err != nil {
+		t.Fatalf("expected %s.jpg to resolve, got: %v", likedRoot, err)
+	}
+	if rootCoverRes.Kind != webdav.CoverFile {
+		t.Fatalf("expected Kind == CoverFile for root cover, got: %v", rootCoverRes.Kind)
+	}
+
+	// 7. Non-existent cover
+	_, err = vl.Stat(ctx, likedRoot+"/Nonexistent Song.jpg")
+	if !errors.Is(err, webdav.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for nonexistent cover, got: %v", err)
 	}
 }

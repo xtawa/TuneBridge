@@ -144,3 +144,32 @@ type staticSession struct {
 func (s staticSession) Load(context.Context, string) (source.Session, error) {
 	return source.Session{Payload: s.payload}, s.err
 }
+
+func TestAdapter_LikeTrack_External(t *testing.T) {
+	t.Parallel()
+	var requestedPath, requestedID, requestedLike string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestedPath = r.URL.Path
+		requestedID = r.URL.Query().Get("id")
+		requestedLike = r.URL.Query().Get("like")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":200}`))
+	}))
+	defer server.Close()
+
+	client, err := New(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := NewAdapter(client, staticSession{payload: []byte("MUSIC_U=test-token")})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := adapter.LikeTrack(context.Background(), "12345", true); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if requestedPath != "/like" || requestedID != "12345" || requestedLike != "true" {
+		t.Fatalf("unexpected request: path=%s id=%s like=%s", requestedPath, requestedID, requestedLike)
+	}
+}

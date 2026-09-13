@@ -22,6 +22,13 @@ func TestSidecarLyricsUsesExactAudioBase(t *testing.T) {
 	}
 }
 
+func TestSidecarCoverUsesExactAudioBase(t *testing.T) {
+	t.Parallel()
+	if got := CoverFilename("晴天 - 周杰伦.flac"); got != "晴天 - 周杰伦.jpg" {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func TestCollisionFilenameKeepsExtensionAndIdentity(t *testing.T) {
 	t.Parallel()
 	got := CollisionFilename("晴天 - 周杰伦.flac", model.TrackIdentity{SourceID: "netease", TrackID: "186016"})

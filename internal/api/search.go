@@ -16,7 +16,10 @@ type SearchResultStore interface {
 	Delete(ctx context.Context, identity model.TrackIdentity) error
 	Clear(ctx context.Context, sourceID string) error
 }
-type SearchInvalidator interface{ InvalidateSearch() }
+type SearchInvalidator interface {
+	InvalidateSearch()
+	InvalidateLiked()
+}
 type SearchHandler struct {
 	source      source.MusicSource
 	store       SearchResultStore
@@ -99,6 +102,35 @@ func (h *SearchHandler) Clear(w http.ResponseWriter, r *http.Request) {
 		h.invalidator.InvalidateSearch()
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *SearchHandler) Like(w http.ResponseWriter, r *http.Request) {
+	if !sameOrigin(r) {
+		writeError(w, http.StatusForbidden, "cross-site request rejected")
+		return
+	}
+	var input struct {
+		TrackID string `json:"track_id"`
+		Like    bool   `json:"like"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil || strings.TrimSpace(input.TrackID) == "" || len(input.TrackID) > 64 {
+		writeError(w, http.StatusBadRequest, "track_id is required")
+		return
+	}
+	if err := h.source.LikeTrack(r.Context(), input.TrackID, input.Like); err != nil {
+		writeError(w, http.StatusInternalServerError, "could not update track like status")
+		return
+	}
+	if h.invalidator != nil {
+		h.invalidator.InvalidateLiked()
+	}
+	status := "liked"
+	if !input.Like {
+		status = "unliked"
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": status})
 }
 
 type searchTrackDTO struct {

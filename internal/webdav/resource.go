@@ -21,6 +21,7 @@ const (
 	Collection ResourceKind = iota
 	AudioFile
 	LyricsFile
+	CoverFile
 )
 
 type Resource struct {

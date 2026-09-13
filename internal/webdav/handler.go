@@ -1,6 +1,8 @@
 package webdav
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"net/http"
@@ -8,6 +10,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/xtawa/tunebridge/internal/auth"
@@ -76,11 +79,11 @@ func (h *Handler) propfind(w http.ResponseWriter, r *http.Request) {
 	}
 	depth, err := parseDepth(r.Header.Get("Depth"))
 	if err != nil {
-		http.Error(w, "only Depth: 0 or Depth: 1 is supported", http.StatusForbidden)
+		http.Error(w, "only Depth: 0, Depth: 1, or Depth: infinity is supported", http.StatusForbidden)
 		return
 	}
 	resources := []Resource{resource}
-	if depth == 1 && resource.IsCollection() {
+	if depth == depthOne && resource.IsCollection() {
 		children, err := h.library.List(r.Context(), resourcePath)
 		if errors.Is(err, ErrNotFound) {
 			http.NotFound(w, r)
@@ -91,6 +94,30 @@ func (h *Handler) propfind(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		resources = append(resources, children...)
+	} else if depth == depthInfinity && resource.IsCollection() {
+		queue := []string{resourcePath}
+		visited := map[string]bool{resourcePath: true}
+		for len(queue) > 0 {
+			curr := queue[0]
+			queue = queue[1:]
+			children, err := h.library.List(r.Context(), curr)
+			if err != nil {
+				if errors.Is(err, ErrNotFound) {
+					continue
+				}
+				http.Error(w, "list virtual resource", http.StatusInternalServerError)
+				return
+			}
+			for _, child := range children {
+				resources = append(resources, child)
+				if child.IsCollection() && !visited[child.Path] {
+					visited[child.Path] = true
+					if len(visited) < 1000 {
+						queue = append(queue, child.Path)
+					}
+				}
+			}
+		}
 	}
 
 	response := multiStatus{XMLNS: "DAV:", Responses: make([]davResponse, 0, len(resources))}
@@ -179,12 +206,20 @@ func requestResourcePath(location *url.URL) (string, bool) {
 	return path.Clean(decoded), true
 }
 
+const (
+	depthZero     = 0
+	depthOne      = 1
+	depthInfinity = -1
+)
+
 func parseDepth(raw string) (int, error) {
 	switch strings.TrimSpace(raw) {
 	case "", "0":
-		return 0, nil
+		return depthZero, nil
 	case "1":
-		return 1, nil
+		return depthOne, nil
+	case "infinity":
+		return depthInfinity, nil
 	default:
 		return 0, errors.New("unsupported depth")
 	}
@@ -200,9 +235,16 @@ func setResourceHeaders(w http.ResponseWriter, resource Resource) {
 	}
 	if !resource.ModifiedAt.IsZero() {
 		w.Header().Set("Last-Modified", resource.ModifiedAt.UTC().Format(http.TimeFormat))
+	} else {
+		w.Header().Set("Last-Modified", time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).Format(http.TimeFormat))
 	}
-	if resource.ETag != "" {
-		w.Header().Set("ETag", resource.ETag)
+	etag := resource.ETag
+	if etag == "" && !resource.IsCollection() {
+		hash := sha256.Sum256([]byte(resource.Path + ":" + strconv.FormatInt(resource.Size, 10)))
+		etag = `"` + hex.EncodeToString(hash[:16]) + `"`
+	}
+	if etag != "" {
+		w.Header().Set("ETag", etag)
 	}
 }
 
@@ -228,6 +270,7 @@ type davProperty struct {
 	GetContentLength string       `xml:"getcontentlength,omitempty"`
 	GetContentType   string       `xml:"getcontenttype,omitempty"`
 	GetLastModified  string       `xml:"getlastmodified,omitempty"`
+	GetETag          string       `xml:"getetag,omitempty"`
 }
 
 type resourceType struct {
@@ -255,6 +298,16 @@ func davResponseFrom(resource Resource) davResponse {
 	}
 	if !resource.ModifiedAt.IsZero() {
 		property.GetLastModified = resource.ModifiedAt.UTC().Format(http.TimeFormat)
+	} else {
+		property.GetLastModified = time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).Format(http.TimeFormat)
+	}
+	etag := resource.ETag
+	if etag == "" && !resource.IsCollection() {
+		hash := sha256.Sum256([]byte(resource.Path + ":" + strconv.FormatInt(resource.Size, 10)))
+		etag = `"` + hex.EncodeToString(hash[:16]) + `"`
+	}
+	if etag != "" {
+		property.GetETag = etag
 	}
 	return davResponse{Href: href, Propstat: propstat{Prop: property, Status: "HTTP/1.1 200 OK"}}
 }

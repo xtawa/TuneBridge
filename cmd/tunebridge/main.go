@@ -87,18 +87,18 @@ func main() {
 		slog.Error("configure search results", "error", err)
 		os.Exit(1)
 	}
-	davLibrary, err = library.NewVirtualLibrary(adapter, proxy, searchStore, cfg.PlaylistTTL, cfg.DailyRecommendationTTL, cfg.LyricsMode)
-	if err != nil {
-		slog.Error("configure virtual library", "error", err)
-		os.Exit(1)
-	}
-	searchHandler = api.NewSearchHandler(adapter, searchStore, davLibrary.(*library.VirtualLibrary))
 	artworkCache, err := artwork.New(adapter, nil, cfg.ArtworkCacheDir, cfg.ArtworkCacheMaxBytes)
 	if err != nil {
 		slog.Error("configure artwork cache", "error", err)
 		os.Exit(1)
 	}
 	artworkHandler = api.NewArtworkHandler(adapter.ID(), artworkCache)
+	davLibrary, err = library.NewVirtualLibrary(adapter, proxy, searchStore, cfg.PlaylistTTL, cfg.DailyRecommendationTTL, cfg.LyricsMode, artworkCache)
+	if err != nil {
+		slog.Error("configure virtual library", "error", err)
+		os.Exit(1)
+	}
+	searchHandler = api.NewSearchHandler(adapter, searchStore, davLibrary.(*library.VirtualLibrary))
 
 	var trace *compattrace.Ring
 	if cfg.CompatibilityTrace {

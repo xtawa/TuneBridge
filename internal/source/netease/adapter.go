@@ -178,6 +178,54 @@ func (a *Adapter) LikedTracks(ctx context.Context) ([]model.Track, error) {
 	return a.tracksByIDs(ctx, ids)
 }
 
+func (a *Adapter) LikeTrack(ctx context.Context, trackID string, like bool) error {
+	if strings.TrimSpace(trackID) == "" {
+		return errors.New("track ID is required")
+	}
+	likeStr := "true"
+	if !like {
+		likeStr = "false"
+	}
+	if !a.client.IsExternal() {
+		cookie, err := a.loadCookie(ctx)
+		if err != nil {
+			return err
+		}
+		a.syncSDKCookie(cookie)
+		likeService := &service.LikeService{
+			ID: trackID,
+			L:  likeStr,
+		}
+		code, body := likeService.Like()
+		if int(code) != http.StatusOK {
+			return apiError(int(code), "like track failed")
+		}
+		var response struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(body, &response); err != nil {
+			return fmt.Errorf("decode like response: %w", err)
+		}
+		if response.Code != http.StatusOK && response.Code != 0 {
+			return apiError(response.Code, response.Message)
+		}
+		return nil
+	}
+
+	var response struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	}
+	if _, err := a.authedGet(ctx, "/like", url.Values{"id": {trackID}, "like": {likeStr}}, &response); err != nil {
+		return err
+	}
+	if response.Code != http.StatusOK && response.Code != 0 {
+		return apiError(response.Code, response.Message)
+	}
+	return nil
+}
+
 func (a *Adapter) Playlists(ctx context.Context) ([]source.Playlist, error) {
 	profile, err := a.UserProfile(ctx)
 	if err != nil {

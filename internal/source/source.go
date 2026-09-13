@@ -16,6 +16,7 @@ type MusicSource interface {
 	RefreshSession(ctx context.Context, session Session) (Session, error)
 	UserProfile(ctx context.Context) (UserProfile, error)
 	LikedTracks(ctx context.Context) ([]model.Track, error)
+	LikeTrack(ctx context.Context, trackID string, like bool) error
 	Playlists(ctx context.Context) ([]Playlist, error)
 	Playlist(ctx context.Context, playlistID string) (Playlist, []model.Track, error)
 	DailyRecommendations(ctx context.Context) ([]model.Track, error)

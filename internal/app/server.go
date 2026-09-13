@@ -58,6 +58,7 @@ func newServer(cfg config.Config, db *sql.DB, logger *slog.Logger, neteaseLogin 
 		mux.Handle("POST /api/search-results", auth.RequireBasic(http.HandlerFunc(searchHandler.Add), cfg.WebDAVUsername, cfg.WebDAVPassword, "TuneBridge"))
 		mux.Handle("DELETE /api/search-results", auth.RequireBasic(http.HandlerFunc(searchHandler.Clear), cfg.WebDAVUsername, cfg.WebDAVPassword, "TuneBridge"))
 		mux.Handle("DELETE /api/search-results/{trackID}", auth.RequireBasic(http.HandlerFunc(searchHandler.Delete), cfg.WebDAVUsername, cfg.WebDAVPassword, "TuneBridge"))
+		mux.Handle("POST /api/sources/netease/like", auth.RequireBasic(http.HandlerFunc(searchHandler.Like), cfg.WebDAVUsername, cfg.WebDAVPassword, "TuneBridge"))
 	}
 	if artworkHandler != nil {
 		mux.Handle("GET /api/artwork/{sourceID}/{trackID}", auth.RequireBasic(http.HandlerFunc(artworkHandler.Serve), cfg.WebDAVUsername, cfg.WebDAVPassword, "TuneBridge"))

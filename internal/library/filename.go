@@ -26,7 +26,7 @@ func LyricsFilename(audioFilename string) string {
 }
 
 func CoverFilename(audioFilename string) string {
-	return strings.TrimSuffix(audioFilename, path.Ext(audioFilename)) + ".cover"
+	return strings.TrimSuffix(audioFilename, path.Ext(audioFilename)) + ".jpg"
 }
 
 func CollisionFilename(audioFilename string, identity model.TrackIdentity) string {
