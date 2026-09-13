@@ -15,6 +15,7 @@ import (
 
 	"github.com/xtawa/tunebridge/internal/model"
 	"github.com/xtawa/tunebridge/internal/source"
+	"github.com/xtawa/tunebridge/internal/source/netease"
 	"github.com/xtawa/tunebridge/internal/stream"
 	"github.com/xtawa/tunebridge/internal/webdav"
 )
@@ -127,12 +128,18 @@ func (l *VirtualLibrary) List(ctx context.Context, resourcePath string) ([]webda
 	case playlistsRoot:
 		s, err := l.playlistIndex(ctx)
 		if err != nil {
+			if errors.Is(err, netease.ErrUnauthenticated) {
+				return []webdav.Resource{}, nil
+			}
 			return nil, err
 		}
 		return cloneResources(s.children[playlistsRoot]), nil
 	case likedRoot, dailyRoot, searchRoot:
 		s, err := l.trackSnapshot(ctx, resourcePath)
 		if err != nil {
+			if errors.Is(err, netease.ErrUnauthenticated) {
+				return []webdav.Resource{}, nil
+			}
 			return nil, err
 		}
 		return cloneResources(s.children[resourcePath]), nil
@@ -140,6 +147,9 @@ func (l *VirtualLibrary) List(ctx context.Context, resourcePath string) ([]webda
 		if strings.HasPrefix(resourcePath, playlistsRoot+"/") {
 			s, err := l.playlistSnapshot(ctx, resourcePath)
 			if err != nil {
+				if errors.Is(err, netease.ErrUnauthenticated) {
+					return []webdav.Resource{}, nil
+				}
 				return nil, err
 			}
 			return cloneResources(s.children[resourcePath]), nil

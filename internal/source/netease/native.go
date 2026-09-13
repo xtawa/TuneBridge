@@ -537,6 +537,22 @@ func (c *NativeClient) verifyAccountWithCookie(ctx context.Context, cookie strin
 }
 
 func (c *NativeClient) UserProfile(ctx context.Context, cookie string) (source.UserProfile, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.populateJarFromCookieString(cookie)
+	c.ensureSDeviceID()
+	if !c.isCustomURL() {
+		accountService := &service.UserAccountService{}
+		code, body := accountService.AccountInfo()
+		if int(code) != http.StatusOK {
+			return source.UserProfile{}, apiError(int(code), "fetch account profile failed")
+		}
+		var resp accountResponse
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return source.UserProfile{}, fmt.Errorf("decode account profile: %w", err)
+		}
+		return extractProfile(&resp)
+	}
 	return c.verifyAccountWithCookie(ctx, cookie)
 }
 

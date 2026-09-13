@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-musicfox/netease-music/service"
+	"github.com/go-musicfox/netease-music/util"
 	"github.com/xtawa/tunebridge/internal/model"
 	"github.com/xtawa/tunebridge/internal/source"
 )
@@ -110,11 +112,51 @@ func (a *Adapter) userProfile(ctx context.Context, cookie string) (source.UserPr
 	return source.UserProfile{ID: response.Data.Profile.ID.String(), DisplayName: response.Data.Profile.Nickname}, nil
 }
 
+func (a *Adapter) syncSDKCookie(cookie string) {
+	jar := util.GetGlobalCookieJar()
+	cookieMap := util.ParseCookieString(cookie)
+	util.AddCookiesToJar(jar, cookieMap, DefaultNeteaseBaseURL)
+	if a.client != nil && a.client.native != nil {
+		a.client.native.populateJarFromCookieString(cookie)
+	}
+}
+
 func (a *Adapter) LikedTracks(ctx context.Context) ([]model.Track, error) {
 	profile, err := a.UserProfile(ctx)
 	if err != nil {
 		return nil, err
 	}
+	if !a.client.IsExternal() {
+		cookie, err := a.loadCookie(ctx)
+		if err != nil {
+			return nil, err
+		}
+		a.syncSDKCookie(cookie)
+		likeService := &service.LikeListService{UID: profile.ID}
+		code, body := likeService.LikeList()
+		if int(code) != http.StatusOK {
+			return nil, apiError(int(code), "fetch liked tracks failed")
+		}
+		var response struct {
+			Code    int          `json:"code"`
+			IDs     []flexibleID `json:"ids"`
+			Message string       `json:"message"`
+		}
+		if err := json.Unmarshal(body, &response); err != nil {
+			return nil, fmt.Errorf("decode liked tracks: %w", err)
+		}
+		if response.Code != http.StatusOK {
+			return nil, apiError(response.Code, response.Message)
+		}
+		ids := make([]string, 0, len(response.IDs))
+		for _, id := range response.IDs {
+			if id.String() != "" {
+				ids = append(ids, id.String())
+			}
+		}
+		return a.tracksByIDs(ctx, ids)
+	}
+
 	var response struct {
 		Code    int          `json:"code"`
 		IDs     []flexibleID `json:"ids"`
@@ -140,6 +182,44 @@ func (a *Adapter) Playlists(ctx context.Context) ([]source.Playlist, error) {
 	if err != nil {
 		return nil, err
 	}
+	if !a.client.IsExternal() {
+		cookie, err := a.loadCookie(ctx)
+		if err != nil {
+			return nil, err
+		}
+		a.syncSDKCookie(cookie)
+		playlistService := &service.UserPlaylistService{
+			Uid:   profile.ID,
+			Limit: "1000",
+		}
+		code, body := playlistService.UserPlaylist()
+		if int(code) != http.StatusOK {
+			return nil, apiError(int(code), "fetch playlists failed")
+		}
+		var response struct {
+			Code     int `json:"code"`
+			Playlist []struct {
+				ID          flexibleID `json:"id"`
+				Name        string     `json:"name"`
+				Description string     `json:"description"`
+			} `json:"playlist"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(body, &response); err != nil {
+			return nil, fmt.Errorf("decode playlists: %w", err)
+		}
+		if response.Code != http.StatusOK {
+			return nil, apiError(response.Code, response.Message)
+		}
+		result := make([]source.Playlist, 0, len(response.Playlist))
+		for _, playlist := range response.Playlist {
+			if playlist.ID.String() != "" {
+				result = append(result, source.Playlist{ID: playlist.ID.String(), Name: playlist.Name, Description: playlist.Description})
+			}
+		}
+		return result, nil
+	}
+
 	var response struct {
 		Code     int `json:"code"`
 		Playlist []struct {
@@ -168,6 +248,46 @@ func (a *Adapter) Playlist(ctx context.Context, playlistID string) (source.Playl
 	if strings.TrimSpace(playlistID) == "" {
 		return source.Playlist{}, nil, errors.New("playlist ID is required")
 	}
+	if !a.client.IsExternal() {
+		cookie, err := a.loadCookie(ctx)
+		if err != nil {
+			return source.Playlist{}, nil, err
+		}
+		a.syncSDKCookie(cookie)
+
+		allTracksService := &service.PlaylistTrackAllService{
+			Id: playlistID,
+		}
+		code, body := allTracksService.AllTracks()
+		if int(code) != http.StatusOK {
+			return source.Playlist{}, nil, apiError(int(code), "fetch playlist tracks failed")
+		}
+		var response struct {
+			Code     int `json:"code"`
+			Playlist struct {
+				ID          flexibleID `json:"id"`
+				Name        string     `json:"name"`
+				Description string     `json:"description"`
+				TrackCount  int        `json:"trackCount"`
+				Tracks      []songDTO  `json:"tracks"`
+			} `json:"playlist"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(body, &response); err != nil {
+			return source.Playlist{}, nil, fmt.Errorf("decode playlist: %w", err)
+		}
+		if response.Code != http.StatusOK || response.Playlist.ID.String() == "" {
+			return source.Playlist{}, nil, apiError(response.Code, response.Message)
+		}
+		playlist := source.Playlist{
+			ID:          response.Playlist.ID.String(),
+			Name:        response.Playlist.Name,
+			Description: response.Playlist.Description,
+		}
+		tracks := tracksFromDTO(response.Playlist.Tracks)
+		return playlist, tracks, nil
+	}
+
 	var detail struct {
 		Code     int `json:"code"`
 		Playlist struct {
@@ -208,6 +328,33 @@ func (a *Adapter) Playlist(ctx context.Context, playlistID string) (source.Playl
 }
 
 func (a *Adapter) DailyRecommendations(ctx context.Context) ([]model.Track, error) {
+	if !a.client.IsExternal() {
+		cookie, err := a.loadCookie(ctx)
+		if err != nil {
+			return nil, err
+		}
+		a.syncSDKCookie(cookie)
+		recService := &service.RecommendSongsService{}
+		code, body := recService.RecommendSongs()
+		if int(code) != http.StatusOK {
+			return nil, apiError(int(code), "fetch daily recommendations failed")
+		}
+		var response struct {
+			Code int `json:"code"`
+			Data struct {
+				Songs []songDTO `json:"dailySongs"`
+			} `json:"data"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(body, &response); err != nil {
+			return nil, fmt.Errorf("decode daily recommendations: %w", err)
+		}
+		if response.Code != http.StatusOK {
+			return nil, apiError(response.Code, response.Message)
+		}
+		return tracksFromDTO(response.Data.Songs), nil
+	}
+
 	var response struct {
 		Code int `json:"code"`
 		Data struct {
@@ -228,6 +375,36 @@ func (a *Adapter) SearchTracks(ctx context.Context, query string) ([]model.Track
 	if strings.TrimSpace(query) == "" {
 		return nil, errors.New("search query is required")
 	}
+	if !a.client.IsExternal() {
+		cookie, _ := a.loadCookie(ctx)
+		if cookie != "" {
+			a.syncSDKCookie(cookie)
+		}
+		searchService := &service.SearchService{
+			S:     query,
+			Type:  "1",
+			Limit: "50",
+		}
+		code, body := searchService.Search()
+		if int(code) != http.StatusOK {
+			return nil, apiError(int(code), "search tracks failed")
+		}
+		var response struct {
+			Code   int `json:"code"`
+			Result struct {
+				Songs []songDTO `json:"songs"`
+			} `json:"result"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(body, &response); err != nil {
+			return nil, fmt.Errorf("decode search result: %w", err)
+		}
+		if response.Code != http.StatusOK {
+			return nil, apiError(response.Code, response.Message)
+		}
+		return tracksFromDTO(response.Result.Songs), nil
+	}
+
 	var response struct {
 		Code   int `json:"code"`
 		Result struct {
@@ -267,6 +444,38 @@ func (a *Adapter) Lyrics(ctx context.Context, id model.TrackIdentity) (model.Lyr
 	if err := validateIdentity(id); err != nil {
 		return model.Lyrics{}, err
 	}
+	if !a.client.IsExternal() {
+		cookie, _ := a.loadCookie(ctx)
+		if cookie != "" {
+			a.syncSDKCookie(cookie)
+		}
+		lyricService := &service.LyricService{ID: id.TrackID}
+		code, body := lyricService.Lyric()
+		if int(code) != http.StatusOK {
+			return model.Lyrics{}, apiError(int(code), "fetch lyrics failed")
+		}
+		var response struct {
+			Code    int                                   `json:"code"`
+			LRC     struct{ Lyric string `json:"lyric"` } `json:"lrc"`
+			TLRC    struct{ Lyric string `json:"lyric"` } `json:"tlyric"`
+			Roman   struct{ Lyric string `json:"lyric"` } `json:"romalrc"`
+			YRC     struct{ Lyric string `json:"lyric"` } `json:"yrc"`
+			Message string                                `json:"message"`
+		}
+		if err := json.Unmarshal(body, &response); err != nil {
+			return model.Lyrics{}, fmt.Errorf("decode lyrics: %w", err)
+		}
+		if response.Code != http.StatusOK {
+			return model.Lyrics{}, apiError(response.Code, response.Message)
+		}
+		return model.Lyrics{
+			Original:     response.LRC.Lyric,
+			Translated:   response.TLRC.Lyric,
+			Romanized:    response.Roman.Lyric,
+			WordTimedRaw: response.YRC.Lyric,
+		}, nil
+	}
+
 	var response struct {
 		Code int `json:"code"`
 		LRC  struct {
@@ -299,6 +508,60 @@ func (a *Adapter) ResolveStream(ctx context.Context, id model.TrackIdentity, qua
 	if !validQuality(quality) {
 		return model.ResolvedStream{}, errors.New("unsupported preferred quality")
 	}
+	if !a.client.IsExternal() {
+		cookie, _ := a.loadCookie(ctx)
+		if cookie != "" {
+			a.syncSDKCookie(cookie)
+		}
+		level := mapQuality(quality)
+		urlService := &service.SongUrlV1Service{
+			ID:    id.TrackID,
+			Level: level,
+		}
+		code, body, err := urlService.SongUrl()
+		if err != nil {
+			return model.ResolvedStream{}, fmt.Errorf("resolve song url: %w", err)
+		}
+		if int(code) != http.StatusOK {
+			return model.ResolvedStream{}, apiError(int(code), "resolve stream failed")
+		}
+		var response struct {
+			Code int `json:"code"`
+			Data []struct {
+				URL        string `json:"url"`
+				Size       int64  `json:"size"`
+				Type       string `json:"type"`
+				EncodeType string `json:"encodeType"`
+				Bitrate    int    `json:"br"`
+			} `json:"data"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(body, &response); err != nil {
+			return model.ResolvedStream{}, fmt.Errorf("decode stream response: %w", err)
+		}
+		if response.Code != http.StatusOK {
+			return model.ResolvedStream{}, apiError(response.Code, response.Message)
+		}
+		if len(response.Data) != 1 || response.Data[0].URL == "" {
+			return model.ResolvedStream{}, errors.New("track is unavailable at the requested quality")
+		}
+		item := response.Data[0]
+		extension := strings.ToLower(item.Type)
+		if extension == "" {
+			extension = strings.ToLower(item.EncodeType)
+		}
+		return model.ResolvedStream{
+			URL:  item.URL,
+			Size: item.Size,
+			Format: model.AudioFormat{
+				Extension:   extension,
+				ContentType: contentType(extension),
+				Codec:       item.EncodeType,
+				BitrateKbps: item.Bitrate / 1000,
+			},
+		}, nil
+	}
+
 	var response struct {
 		Code int `json:"code"`
 		Data []struct {
@@ -327,10 +590,58 @@ func (a *Adapter) ResolveStream(ctx context.Context, id model.TrackIdentity, qua
 	return model.ResolvedStream{URL: item.URL, Size: item.Size, Format: model.AudioFormat{Extension: extension, ContentType: contentType(extension), Codec: item.EncodeType, BitrateKbps: item.Bitrate / 1000}}, nil
 }
 
+func mapQuality(q source.Quality) service.SongQualityLevel {
+	switch q {
+	case source.QualityLossless:
+		return service.Lossless
+	case source.QualityExHigh:
+		return service.Exhigh
+	case source.QualityHigher:
+		return service.Higher
+	default:
+		return service.Standard
+	}
+}
+
 func (a *Adapter) tracksByIDs(ctx context.Context, ids []string) ([]model.Track, error) {
 	if len(ids) == 0 {
 		return []model.Track{}, nil
 	}
+	if !a.client.IsExternal() {
+		cookie, err := a.loadCookie(ctx)
+		if err != nil {
+			return nil, err
+		}
+		a.syncSDKCookie(cookie)
+		all := make([]model.Track, 0, len(ids))
+		for start := 0; start < len(ids); start += 500 {
+			end := start + 500
+			if end > len(ids) {
+				end = len(ids)
+			}
+			songService := &service.SongDetailService{
+				Ids: strings.Join(ids[start:end], ","),
+			}
+			code, body := songService.SongDetail()
+			if int(code) != http.StatusOK {
+				return nil, apiError(int(code), "song detail failed")
+			}
+			var response struct {
+				Code    int       `json:"code"`
+				Songs   []songDTO `json:"songs"`
+				Message string    `json:"message"`
+			}
+			if err := json.Unmarshal(body, &response); err != nil {
+				return nil, fmt.Errorf("decode song detail: %w", err)
+			}
+			if response.Code != http.StatusOK {
+				return nil, apiError(response.Code, response.Message)
+			}
+			all = append(all, tracksFromDTO(response.Songs)...)
+		}
+		return all, nil
+	}
+
 	all := make([]model.Track, 0, len(ids))
 	for start := 0; start < len(ids); start += 100 {
 		end := start + 100
