@@ -53,6 +53,22 @@ func TestLoadRequiresEncryptionKeyForNeteaseAdapter(t *testing.T) {
 	}
 }
 
+func TestLoadAcceptsNeteaseAPIURLAlias(t *testing.T) {
+	t.Parallel()
+	cfg, err := Load(fromMap(map[string]string{
+		"TUNEBRIDGE_WEBDAV_USERNAME":       "user",
+		"TUNEBRIDGE_WEBDAV_PASSWORD":       "password",
+		"TUNEBRIDGE_NETEASE_API_URL":        "http://netease-api:3000",
+		"TUNEBRIDGE_SESSION_ENCRYPTION_KEY": "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.NeteaseAPIBaseURL != "http://netease-api:3000" {
+		t.Fatalf("expected http://netease-api:3000, got %s", cfg.NeteaseAPIBaseURL)
+	}
+}
+
 func fromMap(values map[string]string) LookupEnv {
 	return func(key string) (string, bool) {
 		value, ok := values[key]

@@ -52,6 +52,11 @@ func Load(lookup LookupEnv) (Config, error) {
 		return Config{}, fmt.Errorf("TUNEBRIDGE_ARTWORK_CACHE_MAX_BYTES: %w", err)
 	}
 
+	neteaseURL := value(lookup, "TUNEBRIDGE_NETEASE_API_URL", "")
+	if neteaseURL == "" {
+		neteaseURL = value(lookup, "TUNEBRIDGE_NETEASE_API_BASE_URL", "")
+	}
+
 	cfg := Config{
 		ListenAddress:          value(lookup, "TUNEBRIDGE_LISTEN_ADDRESS", ":8080"),
 		DataDir:                dataDir,
@@ -62,7 +67,7 @@ func Load(lookup LookupEnv) (Config, error) {
 		ArtworkCacheMaxBytes:   artworkMaxBytes,
 		WebDAVUsername:         value(lookup, "TUNEBRIDGE_WEBDAV_USERNAME", ""),
 		WebDAVPassword:         value(lookup, "TUNEBRIDGE_WEBDAV_PASSWORD", ""),
-		NeteaseAPIBaseURL:      value(lookup, "TUNEBRIDGE_NETEASE_API_BASE_URL", ""),
+		NeteaseAPIBaseURL:      neteaseURL,
 		SessionEncryptionKey:   value(lookup, "TUNEBRIDGE_SESSION_ENCRYPTION_KEY", ""),
 		PlaylistTTL:            duration(lookup, "TUNEBRIDGE_PLAYLIST_TTL", 5*time.Minute),
 		DailyRecommendationTTL: duration(lookup, "TUNEBRIDGE_DAILY_RECOMMENDATION_TTL", time.Hour),

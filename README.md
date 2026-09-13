@@ -30,28 +30,30 @@ TuneBridge 是一个专为离线音乐播放器（如 OnePlayer）设计的 WebD
 | `TUNEBRIDGE_COMPAT_TRACE` | 否 | `false` | 启用 200 条内存兼容性 trace；通过受认证的 `/api/debug/recent-requests` 读取。 |
 | `TUNEBRIDGE_PLAYLIST_TTL` | 否 | `5m` | 歌单元数据缓存时间。 |
 | `TUNEBRIDGE_DAILY_RECOMMENDATION_TTL` | 否 | `1h` | 每日推荐元数据缓存时间。 |
-| `TUNEBRIDGE_NETEASE_API_BASE_URL` | 否 | 无 | 用户自选或自建的 [NeteaseCloudMusicApi](https://github.com/Binaryify/NeteaseCloudMusicApi) 兼容服务绝对 URL。**无任何公共默认地址**。 |
-| `TUNEBRIDGE_SESSION_ENCRYPTION_KEY` | 条件必填* | 无 | Base64 编码的 32 字节密钥，用于 AES-GCM 会话加密。*若配置了 `TUNEBRIDGE_NETEASE_API_BASE_URL` 则**必须**提供。 |
+| `TUNEBRIDGE_NETEASE_API_URL` | 否 | 无 | 可选外部后端 [NeteaseCloudMusicApi](https://github.com/Binaryify/NeteaseCloudMusicApi) 兼容服务绝对 URL（别名：`TUNEBRIDGE_NETEASE_API_BASE_URL`）。未配置时默认使用 TuneBridge 原生网易云直连能力。 |
+| `TUNEBRIDGE_SESSION_ENCRYPTION_KEY` | 否 | 自动生成 | Base64 编码的 32 字节密钥，用于 AES-GCM 会话加密。未配置时自动在 `$TUNEBRIDGE_DATA_DIR/session.key` 生成持久化密钥。 |
 
-## 网易云扫码登录对接
+## 网易云原生登录与 Cookie 导入
 
-TuneBridge 支持可选的网易云音乐扫码登录功能。该功能默认关闭，仅在配置了 `TUNEBRIDGE_NETEASE_API_BASE_URL` 与 `TUNEBRIDGE_SESSION_ENCRYPTION_KEY` 时启用。
+TuneBridge 内置原生网易云扫码登录与 Cookie 导入能力，**默认无需额外部署任何外部 NeteaseCloudMusicApi 服务**。
 
-### 1. 配置前提与密钥要求
+### 1. 移动端登录配置页面 (`/setup/netease`)
 
-- **上游服务地址**：`TUNEBRIDGE_NETEASE_API_BASE_URL` 必须指向用户自选或自建的 NeteaseCloudMusicApi 兼容服务，TuneBridge **不提供任何公共默认端点**。
-- **会话加密密钥**：`TUNEBRIDGE_SESSION_ENCRYPTION_KEY` 必须可解码为 32 字节（256 位，用于 AES-GCM）。可通过以下命令生成：
-  ```bash
-  openssl rand -base64 32
-  ```
-  *(注：切勿在生产环境中使用弱密钥或公开示例密钥。)*
+通过浏览器或手机访问受 Basic Auth 保护的 `/setup/netease`，即可体验完整的登录交互：
+- **实时二维码扫码**：自动生成网易云登录二维码，提供“打开网易云音乐 App 授权”直跳链接，状态机实时轮询（等待扫码、已扫码待确认、授权成功、自动过期提示）。
+- **风控回退机制 (Cookie 导入 Fallback)**：当遇到网易云异地登录或二维码风控限制时，可展开备用面板，直接粘贴 `MUSIC_U` 或完整 Cookie。
+- **二次账号验证**：无论是扫码登录还是 Cookie 导入，服务端均会在同一 Cookie Jar / 会话中调用网易云官方账号接口二次验证，确保凭据真实有效。
+- **AES-GCM 加密落库**：验证通过后使用 AES-GCM 算法持久化到 SQLite `source_sessions` 表。
 
-### 2. 扫码登录接口
+### 2. 登录与会话 API 端点
 
-启用后，TuneBridge 会注册两个 API 路由。这两个路由均受 **HTTP Basic Auth** 保护（与 WebDAV 使用相同的用户名与密码，Realm: `TuneBridge`）：
+所有 API 均受 **HTTP Basic Auth** 保护（与 WebDAV 相同凭据）：
+
+#### `GET /setup/netease`
+- **说明**：移动端原生登录与凭据配置页面。
 
 #### `POST /api/sources/netease/login/qr`
-- **说明**：向自建上游申请二维码 Key 并生成二维码。
+- **说明**：申请二维码 Key 并生成 Base64 PNG 二维码图像。
 - **响应 (`201 Created`)**：
   ```json
   {
@@ -60,27 +62,34 @@ TuneBridge 支持可选的网易云音乐扫码登录功能。该功能默认关
     "image_data": "data:image/png;base64,..."
   }
   ```
-- **错误**：上游异常返回 `502 Bad Gateway`；非 POST 请求返回 `405 Method Not Allowed`。
 
 #### `GET /api/sources/netease/login/qr/{key}`
-- **说明**：轮询指定 `{key}` 的扫码认证状态。
+- **说明**：轮询指定 `{key}` 的扫码认证状态。状态包括 `waiting` (801)、`awaiting_confirmation` (802)、`authorized` (803)、`expired` (800)。
 - **响应 (`200 OK`)**：
   ```json
   {
     "status": "waiting"
   }
   ```
-- **状态值含义**：
-  - `waiting`：等待用户扫码（上游状态码 801）。
-  - `awaiting_confirmation`：已扫码，等待用户在手机端确认授权（上游状态码 802）。
-  - `authorized`：授权成功（上游状态码 803）。服务端将自动获取会话 Cookie、加密并存入 SQLite。
-  - `expired`：二维码已过期（上游状态码 800）。
-- **错误**：Key 为空或无效（如包含斜杠）返回 `400 Bad Request`；上游通信异常返回 `502 Bad Gateway`；非 GET 请求返回 `405 Method Not Allowed`。
 
-### 3. 会话凭据安全与存储机制
+#### `POST /api/sources/netease/login/cookie`
+- **说明**：手动导入 `MUSIC_U` 或完整 Cookie 作为风控备用 fallback。
+- **请求 (`POST`)**：
+  ```json
+  {
+    "cookie": "MUSIC_U=xxxx..."
+  }
+  ```
+- **响应 (`200 OK`)**：`{"status":"authorized"}`
 
-- **AES-GCM 加密存储**：当扫码状态为 `authorized` 时，获取到的 Session Cookie 将使用 `TUNEBRIDGE_SESSION_ENCRYPTION_KEY` 经由 AES-GCM 算法加密，持久化到 SQLite 数据库的 `source_sessions` 表中。
-- **API 绝不暴露 Cookie**：`GET /api/sources/netease/login/qr/{key}` 接口只返回 `{"status":"authorized"}`，**绝不通过 API 返回 Cookie 或会话明文**，避免凭据外泄。
+#### `GET /api/sources/netease/status`
+- **说明**：获取当前网易云会话状态（`{"logged_in": true/false}`）。
+
+### 3. 会话凭据安全与隐私保护
+
+- **严禁密码登录**：系统严格杜绝默认账号密码登录方案，消除凭据滥用风险。
+- **零凭据泄露保障**：登录流程与状态接口严格仅返回状态标识（如 `{"status":"authorized"}`），**绝不在任何 HTTP 响应、HTML 页面或日志流中打印 Cookie、MUSIC_U、__csrf 等敏感凭据**。
+- **AES-GCM 加密存储**：加密落库时采用独立随机 12 字节 Nonce，保障离线凭证高强度安全。
 
 ## 运行示例
 

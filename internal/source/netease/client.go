@@ -21,22 +21,46 @@ const SourceID = "netease"
 type Client struct {
 	baseURL    *url.URL
 	httpClient *http.Client
+	native     *NativeClient
 }
 
 func New(baseURL string, httpClient *http.Client) (*Client, error) {
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 15 * time.Second}
+	}
+	if baseURL == "" || baseURL == DefaultNeteaseBaseURL {
+		native, err := NewNativeClient(DefaultNeteaseBaseURL, httpClient)
+		if err != nil {
+			return nil, err
+		}
+		parsed, _ := url.Parse(DefaultNeteaseBaseURL)
+		return &Client{baseURL: parsed, httpClient: httpClient, native: native}, nil
+	}
 	parsed, err := url.Parse(baseURL)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return nil, errors.New("netease API base URL must be absolute")
 	}
-	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 15 * time.Second}
-	}
-	return &Client{baseURL: parsed, httpClient: httpClient}, nil
+	native, _ := NewNativeClient(DefaultNeteaseBaseURL, httpClient)
+	return &Client{baseURL: parsed, httpClient: httpClient, native: native}, nil
+}
+
+func (c *Client) IsExternal() bool {
+	return c.baseURL != nil && c.baseURL.String() != DefaultNeteaseBaseURL
 }
 
 func (c *Client) ID() string { return SourceID }
 
+func (c *Client) VerifyCookie(ctx context.Context, rawCookie string) (source.Session, error) {
+	if c.native != nil {
+		return c.native.VerifyCookie(ctx, rawCookie)
+	}
+	return source.Session{}, errors.New("native verification client not configured")
+}
+
 func (c *Client) CreateQRCode(ctx context.Context) (source.QRCode, error) {
+	if !c.IsExternal() && c.native != nil {
+		return c.native.CreateQRCode(ctx)
+	}
 	var keyResponse struct {
 		Code int `json:"code"`
 		Data struct {
@@ -71,6 +95,9 @@ func (c *Client) CreateQRCode(ctx context.Context) (source.QRCode, error) {
 func (c *Client) CheckQRCode(ctx context.Context, key string) (source.QRLoginStatus, source.Session, error) {
 	if strings.TrimSpace(key) == "" {
 		return "", source.Session{}, errors.New("QR login key is required")
+	}
+	if !c.IsExternal() && c.native != nil {
+		return c.native.CheckQRCode(ctx, key)
 	}
 	var response struct {
 		Code    int    `json:"code"`

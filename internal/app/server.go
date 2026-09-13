@@ -46,8 +46,11 @@ func newServer(cfg config.Config, db *sql.DB, logger *slog.Logger, neteaseLogin 
 	mux.HandleFunc("GET /healthz", server.health)
 	mux.HandleFunc("GET /readyz", server.ready)
 	if neteaseLogin != nil {
+		mux.Handle("GET /setup/netease", auth.RequireBasic(api.NewSetupPageHandler(), cfg.WebDAVUsername, cfg.WebDAVPassword, "TuneBridge"))
 		mux.Handle("POST /api/sources/netease/login/qr", auth.RequireBasic(http.HandlerFunc(neteaseLogin.Begin), cfg.WebDAVUsername, cfg.WebDAVPassword, "TuneBridge"))
 		mux.Handle("GET /api/sources/netease/login/qr/{key}", auth.RequireBasic(http.HandlerFunc(neteaseLogin.Check), cfg.WebDAVUsername, cfg.WebDAVPassword, "TuneBridge"))
+		mux.Handle("POST /api/sources/netease/login/cookie", auth.RequireBasic(http.HandlerFunc(neteaseLogin.ImportCookie), cfg.WebDAVUsername, cfg.WebDAVPassword, "TuneBridge"))
+		mux.Handle("GET /api/sources/netease/status", auth.RequireBasic(http.HandlerFunc(neteaseLogin.Status), cfg.WebDAVUsername, cfg.WebDAVPassword, "TuneBridge"))
 	}
 	if searchHandler != nil {
 		mux.Handle("GET /search", auth.RequireBasic(api.NewSearchPageHandler(), cfg.WebDAVUsername, cfg.WebDAVPassword, "TuneBridge"))

@@ -35,20 +35,26 @@
   - **当前仅为 WebDAV 协议骨架与固定目录视图，尚未接入任何真实音频流传输，无法供 OnePlayer 进行真正的音频点播或离线回放**。
 - **测试验证**：`internal/webdav/handler_test.go` 覆盖了认证拦截、只读方法声明、`Depth: 0/1` 的 XML 转义与 URL 编码、以及非法 Depth 拦截。
 
-### 1.3 可选网易云扫码登录流程与会话持久化
-- **挂载条件与配置要求**：
-  - 默认不启用。仅当环境变量 `TUNEBRIDGE_NETEASE_API_BASE_URL` 配置了合法的 HTTP/HTTPS 绝对 URL 时激活挂载。
-  - 激活时**强制要求**提供 `TUNEBRIDGE_SESSION_ENCRYPTION_KEY`（必须为 Base64 编码的 32 字节密钥），否则配置校验失败直接退出。
-  - **上游依赖说明**：TuneBridge **不提供任何公开默认的网易云 API 服务端点与密钥**，完全依赖用户自选或自建的兼容 [NeteaseCloudMusicApi](https://github.com/Binaryify/NeteaseCloudMusicApi) 服务。
-- **提供端点**（受与 WebDAV 相同的 HTTP Basic Auth 保护）：
-  - `POST /api/sources/netease/login/qr`：向自建上游请求生成二维码 Key 与图像。成功返回 HTTP 201 Created，载荷包含 `key`、`url`、`image_data`；上游异常返回 HTTP 502 Bad Gateway；非 POST 请求返回 HTTP 405。
-  - `GET /api/sources/netease/login/qr/{key}`：向自建上游轮询指定 Key 的扫码状态。映射状态包括 `waiting` (801)、`awaiting_confirmation` (802)、`authorized` (803)、`expired` (800)；Key 为空或非法字符返回 HTTP 400；上游通信故障返回 HTTP 502；非 GET 请求返回 HTTP 405。
-- **持久化与安全保护**：
-  - 当状态为 `authorized` 时，服务端自动提取会话 Cookie，使用 AES-GCM 算法（每次随机生成 12 字节 Nonce）加密后写入 SQLite 的 `source_sessions` 表（`encrypted_payload` BLOB 字段）。
-  - **会话安全性保证**：API 端点响应严格仅返回 `{"status":"authorized"}`，**绝不通过 HTTP 响应暴露 Cookie、Token 明文或解密密钥**；日志亦脱敏不打印会话载荷。
-- **与真实账号联调的明确边界**：
-  - **当前仅验证了扫码状态机与加密落库流程，所有测试均针对 Mock 上游执行，不代表真实网易云账号及公网环境下的验证**。
-- **测试验证**：`internal/api/netease_login_test.go`、`internal/app/server_test.go`、`internal/session/repository_test.go` 覆盖了扫码创建、状态轮询、Basic Auth 鉴权、AES-GCM 加密落库及禁止泄露 Cookie 的断言。
+### 1.3 TuneBridge 原生网易云扫码登录、Cookie 导入 Fallback 与会话持久化
+- **运行模式与配置要求**：
+  - **原生内置能力**：无需额外部署任何外部 `NeteaseCloudMusicApi` 服务，开箱默认直连网易云官方接口。
+  - **可选外部后端**：现有 `TUNEBRIDGE_NETEASE_API_URL`（及别名 `TUNEBRIDGE_NETEASE_API_BASE_URL`）降级为可选 external backend，而非必填项。
+  - **自动密钥管理**：若未显式配置 `TUNEBRIDGE_SESSION_ENCRYPTION_KEY`，系统自动在 `$TUNEBRIDGE_DATA_DIR/session.key` 生成并安全维护 32 字节 AES-GCM 加密密钥（权限 `0600`）。
+- **认证方式与安全红线**：
+  - **默认方案**：提供 QR 扫码登录 + 手动 Cookie / MUSIC_U 导入 fallback。
+  - **严禁密码登录**：严格杜绝密码登录作为默认方案，防止凭据风险。
+- **提供端点与界面**（受与 WebDAV 相同的 HTTP Basic Auth 保护）：
+  - `GET /setup/netease`：移动端/浏览器端登录页面，支持二维码实时生成、App 唤起、状态轮询与 Cookie 导入 fallback。
+  - `POST /api/sources/netease/login/qr`：原生向官方接口申请二维码 Key 并本地生成 Base64 PNG 二维码图像。
+  - `GET /api/sources/netease/login/qr/{key}`：轮询指定 Key 扫码状态，映射 800 (expired)、801 (waiting)、802 (awaiting_confirmation)、803 (authorized)。
+  - `POST /api/sources/netease/login/cookie`：接收手动输入的 `MUSIC_U` 或 Cookie 进行回退登录。
+  - `GET /api/sources/netease/status`：获取当前登录状态标识（`{"logged_in": true/false}`）。
+- **二次验证与持久化机制**：
+  - 当扫码状态命中 803 或执行 Cookie 导入时，在**同一 Cookie Jar** 中提取凭据，并立即调用网易云官方账号接口（`/api/nuser/account/get`）执行二次校验。校验通过后，使用 AES-GCM 算法（12 字节独立 Nonce）加密写入 SQLite `source_sessions` 表。
+  - 若二次校验失败（如 session 无效、account 为空），拒绝落库并返回错误。
+- **零凭据泄露保证**：
+  - 全流程严格禁止将 `Cookie`、`MUSIC_U`、`__csrf` 或网易云敏感原始响应写入 HTTP 响应体或系统日志。
+- **测试验证**：`internal/source/netease/native_test.go`、`internal/api/netease_login_test.go` 覆盖了 800/801/802/803、过期、超时、取消、重复扫码、成功但 Cookie 无效、Cookie 导入成功/失败以及零敏感数据泄露断言。
 
 ### 1.4 配置与底层数据库基础设施
 - **配置系统 (`internal/config`)**：支持从环境变量加载配置，校验绝对路径、缓存上限（默认 10GB）、歌单 TTL（默认 5m）、日推 TTL（默认 1h）及网易云配置依赖完整性。
@@ -150,3 +156,16 @@
    利用 `AudioCacheDir` 与 SQLite `cache_entries` 表，实现音频流本地缓存落盘、重复请求命中与容量超限自动清理。
 4. **进行真实账号与真实 iOS OnePlayer 设备端到端联调**：
    对接真实的 NeteaseCloudMusicApi 服务完成实机扫码，并在 iOS OnePlayer 客户端实测 WebDAV 挂载、歌曲扫描、音频播放、Seek 以及歌词/封面呈现。
+
+---
+
+## 4. TuneBridge 本身尚未实现的功能
+
+即使完成扫码登录，当前仓库版本仍缺少：
+* 网易云歌单动态映射至 WebDAV（已在 VirtualLibrary 实现骨架，待真实联调）
+* 歌曲音频流播放（代理流媒体与上游直链已支持，待实测稳定性）
+* HTTP Range/Seek（单 Range 206 已支持，待真实客户端验证）
+* 音频缓存与自动清理（已支持 LRU 与本地持久化，待实测容量淘汰）
+* 浏览器二维码登录页面（本次已交付原生 `/setup/netease` 页面）
+* Cookie 自动刷新
+* 真实网易云账号的完整实机验证

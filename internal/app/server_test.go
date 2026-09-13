@@ -53,6 +53,28 @@ func TestNeteaseLoginRouteUsesSharedBasicAuthentication(t *testing.T) {
 	if response.Code != http.StatusCreated {
 		t.Fatalf("authorized status = %d: %s", response.Code, response.Body.String())
 	}
+
+	// Verify /setup/netease requires Basic Auth and returns HTML when authenticated
+	unauthSetup := httptest.NewRecorder()
+	server.Handler().ServeHTTP(unauthSetup, httptest.NewRequest(http.MethodGet, "/setup/netease", nil))
+	if unauthSetup.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated /setup/netease, got %d", unauthSetup.Code)
+	}
+
+	authSetup := httptest.NewRecorder()
+	reqSetup := httptest.NewRequest(http.MethodGet, "/setup/netease", nil)
+	reqSetup.SetBasicAuth("user", "password")
+	server.Handler().ServeHTTP(authSetup, reqSetup)
+	if authSetup.Code != http.StatusOK {
+		t.Fatalf("expected 200 for authenticated /setup/netease, got %d", authSetup.Code)
+	}
+
+	// Verify /api/sources/netease/status requires Basic Auth
+	unauthStatus := httptest.NewRecorder()
+	server.Handler().ServeHTTP(unauthStatus, httptest.NewRequest(http.MethodGet, "/api/sources/netease/status", nil))
+	if unauthStatus.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated /api/sources/netease/status, got %d", unauthStatus.Code)
+	}
 }
 
 type testWriter struct{ t *testing.T }
