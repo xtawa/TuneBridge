@@ -57,6 +57,13 @@ func (c *Client) VerifyCookie(ctx context.Context, rawCookie string) (source.Ses
 	return source.Session{}, errors.New("native verification client not configured")
 }
 
+func (c *Client) RefreshToken(ctx context.Context, session source.Session) (source.Session, error) {
+	if c.native != nil && (!c.IsExternal() || c.native.baseURL.String() == c.baseURL.String()) {
+		return c.native.RefreshToken(ctx, session)
+	}
+	return session, nil
+}
+
 func (c *Client) CreateQRCode(ctx context.Context) (source.QRCode, error) {
 	if !c.IsExternal() && c.native != nil {
 		return c.native.CreateQRCode(ctx)
@@ -141,7 +148,9 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("netease API returned code %d: %s", e.Code, e.Message)
 }
 
-func apiError(code int, message string) error { return &APIError{Code: code, Message: message} }
+func apiError(code int, message string) error {
+	return &APIError{Code: code, Message: sanitizeMessage(message)}
+}
 
 func (c *Client) get(ctx context.Context, endpoint string, query url.Values, cookie string, target any) (http.Header, error) {
 	requestURL := *c.baseURL

@@ -21,6 +21,11 @@ type SessionProvider interface {
 	Load(ctx context.Context, sourceID string) (source.Session, error)
 }
 
+type SessionStore interface {
+	SessionProvider
+	Save(ctx context.Context, sourceID string, session source.Session) error
+}
+
 type Adapter struct {
 	client   *Client
 	sessions SessionProvider
@@ -53,16 +58,34 @@ func (a *Adapter) RefreshSession(ctx context.Context, session source.Session) (s
 	if len(session.Payload) == 0 {
 		return source.Session{}, ErrUnauthenticated
 	}
-	if _, err := a.userProfile(ctx, string(session.Payload)); err != nil {
+	refreshed, err := a.client.RefreshToken(ctx, session)
+	if err != nil {
 		return source.Session{}, err
 	}
-	return session, nil
+	if a.client.native != nil && (!a.client.IsExternal() || a.client.native.baseURL.String() == a.client.baseURL.String()) {
+		if _, err := a.client.native.UserProfile(ctx, string(refreshed.Payload)); err != nil {
+			return source.Session{}, err
+		}
+	} else {
+		if _, err := a.userProfile(ctx, string(refreshed.Payload)); err != nil {
+			return source.Session{}, err
+		}
+	}
+	if store, ok := a.sessions.(SessionStore); ok {
+		if err := store.Save(ctx, SourceID, refreshed); err != nil {
+			return source.Session{}, fmt.Errorf("persist refreshed session: %w", err)
+		}
+	}
+	return refreshed, nil
 }
 
 func (a *Adapter) UserProfile(ctx context.Context) (source.UserProfile, error) {
 	cookie, err := a.loadCookie(ctx)
 	if err != nil {
 		return source.UserProfile{}, err
+	}
+	if a.client.native != nil && (!a.client.IsExternal() || a.client.native.baseURL.String() == a.client.baseURL.String()) {
+		return a.client.native.UserProfile(ctx, cookie)
 	}
 	return a.userProfile(ctx, cookie)
 }

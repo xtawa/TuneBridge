@@ -35,13 +35,16 @@
   - **当前仅为 WebDAV 协议骨架与固定目录视图，尚未接入任何真实音频流传输，无法供 OnePlayer 进行真正的音频点播或离线回放**。
 - **测试验证**：`internal/webdav/handler_test.go` 覆盖了认证拦截、只读方法声明、`Depth: 0/1` 的 XML 转义与 URL 编码、以及非法 Depth 拦截。
 
-### 1.3 TuneBridge 原生网易云扫码登录、Cookie 导入 Fallback 与会话持久化
+### 1.3 TuneBridge 原生网易云扫码登录、反风控策略、Cookie 导入 Fallback 与会话持久化
 - **运行模式与配置要求**：
-  - **原生内置能力**：无需额外部署任何外部 `NeteaseCloudMusicApi` 服务，开箱默认直连网易云官方接口。
+  - **原生内置能力**：无需额外部署任何外部 `NeteaseCloudMusicApi` 服务，内置集成活跃开源 Go 库 `github.com/go-musicfox/netease-music`，默认直接通过 Weapi 协议与网易云官方通信。
   - **可选外部后端**：现有 `TUNEBRIDGE_NETEASE_API_URL`（及别名 `TUNEBRIDGE_NETEASE_API_BASE_URL`）降级为可选 external backend，而非必填项。
   - **自动密钥管理**：若未显式配置 `TUNEBRIDGE_SESSION_ENCRYPTION_KEY`，系统自动在 `$TUNEBRIDGE_DATA_DIR/session.key` 生成并安全维护 32 字节 AES-GCM 加密密钥（权限 `0600`）。
+- **反风控机制与参数注入**：
+  - **动态 chainId 溯源参数**：生成的二维码 URL 注入 `chainId=v1_<sDeviceId>_web_login_<timestamp>` 参数，并强制以 `https://` 协议规范化输出，符合网易云移动端扫码安全规范。
+  - **反风控 Cookie 策略**：CookieJar 自动注入 52 位 16 进制随机设备标识（`sDeviceId`）以及 `os=pc`、`__remember_me=true` 等策略参数，彻底避免被官方风控拦截为“环境异常”或立即报 800 失效。
 - **认证方式与安全红线**：
-  - **默认方案**：提供 QR 扫码登录 + 手动 Cookie / MUSIC_U 导入 fallback。
+  - **默认方案**：提供带反风控参数的 QR 扫码登录 + 手动 Cookie / MUSIC_U 导入 fallback。
   - **严禁密码登录**：严格杜绝密码登录作为默认方案，防止凭据风险。
 - **提供端点与界面**（受与 WebDAV 相同的 HTTP Basic Auth 保护）：
   - `GET /setup/netease`：移动端/浏览器端登录页面，支持二维码实时生成、App 唤起、状态轮询与 Cookie 导入 fallback。
@@ -49,12 +52,13 @@
   - `GET /api/sources/netease/login/qr/{key}`：轮询指定 Key 扫码状态，映射 800 (expired)、801 (waiting)、802 (awaiting_confirmation)、803 (authorized)。
   - `POST /api/sources/netease/login/cookie`：接收手动输入的 `MUSIC_U` 或 Cookie 进行回退登录。
   - `GET /api/sources/netease/status`：获取当前登录状态标识（`{"logged_in": true/false}`）。
-- **二次验证与持久化机制**：
+- **二次验证、凭证刷新与持久化机制**：
   - 当扫码状态命中 803 或执行 Cookie 导入时，在**同一 Cookie Jar** 中提取凭据，并立即调用网易云官方账号接口（`/api/nuser/account/get`）执行二次校验。校验通过后，使用 AES-GCM 算法（12 字节独立 Nonce）加密写入 SQLite `source_sessions` 表。
   - 若二次校验失败（如 session 无效、account 为空），拒绝落库并返回错误。
+  - 支持会话凭据刷新（`RefreshToken` / `LoginRefresh`），调用 `/weapi/login/token/refresh` 换取新凭证并由 `Adapter.RefreshSession` 重新加密持久化至 SQLite。
 - **零凭据泄露保证**：
   - 全流程严格禁止将 `Cookie`、`MUSIC_U`、`__csrf` 或网易云敏感原始响应写入 HTTP 响应体或系统日志。
-- **测试验证**：`internal/source/netease/native_test.go`、`internal/api/netease_login_test.go` 覆盖了 800/801/802/803、过期、超时、取消、重复扫码、成功但 Cookie 无效、Cookie 导入成功/失败以及零敏感数据泄露断言。
+- **测试验证**：`internal/source/netease/native_test.go`、`internal/api/netease_login_test.go` 覆盖了 800/801/802/803、过期、超时、取消、重复扫码、成功但 Cookie 无效、Cookie 导入成功/失败、凭据刷新持久化以及零敏感数据泄露断言。
 
 ### 1.4 配置与底层数据库基础设施
 - **配置系统 (`internal/config`)**：支持从环境变量加载配置，校验绝对路径、缓存上限（默认 10GB）、歌单 TTL（默认 5m）、日推 TTL（默认 1h）及网易云配置依赖完整性。

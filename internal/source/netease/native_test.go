@@ -3,6 +3,7 @@ package netease
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -41,9 +42,11 @@ func TestNativeQRLogin_CreateQRCode(t *testing.T) {
 	if qr.Key != "native-key-123" {
 		t.Fatalf("expected key 'native-key-123', got %q", qr.Key)
 	}
-	expectedURL := "https://music.163.com/login?codekey=native-key-123"
-	if qr.URL != expectedURL {
-		t.Fatalf("expected url %q, got %q", expectedURL, qr.URL)
+	if !strings.HasPrefix(qr.URL, "https://music.163.com/login?codekey=native-key-123&chainId=v1_") {
+		t.Fatalf("expected url to start with codekey and chainId, got %q", qr.URL)
+	}
+	if !strings.Contains(qr.URL, "_web_login_") {
+		t.Fatalf("expected chainId to contain platform and action, got %q", qr.URL)
 	}
 	if !strings.HasPrefix(qr.ImageData, "data:image/png;base64,") {
 		t.Fatalf("expected data:image/png;base64 prefix, got %q", qr.ImageData)
@@ -368,3 +371,136 @@ func TestNativeClient_ZeroSensitiveDataLeakageInErrors(t *testing.T) {
 		t.Fatalf("sensitive __csrf leaked in error string: %s", errStr)
 	}
 }
+
+func TestNativeClient_RefreshToken_Success(t *testing.T) {
+	t.Parallel()
+	var refreshCalled atomic.Bool
+	var accountCalled atomic.Bool
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/login/token/refresh":
+			refreshCalled.Store(true)
+			http.SetCookie(w, &http.Cookie{
+				Name:  "__csrf",
+				Value: "new-refreshed-csrf",
+				Path:  "/",
+			})
+			writeJSON(w, `{"code":200}`)
+		case "/api/nuser/account/get":
+			accountCalled.Store(true)
+			writeJSON(w, `{"code":200,"account":{"id":555,"userName":"refreshedUser"},"profile":{"userId":555,"nickname":"Refreshed"}}`)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewNativeClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	initialSession := source.Session{
+		Payload: []byte("MUSIC_U=existing-music-u; __csrf=old-csrf"),
+	}
+	refreshed, err := client.RefreshToken(context.Background(), initialSession)
+	if err != nil {
+		t.Fatalf("unexpected error refreshing token: %v", err)
+	}
+	if !refreshCalled.Load() {
+		t.Fatal("expected refresh endpoint to be called")
+	}
+	if !accountCalled.Load() {
+		t.Fatal("expected secondary verification to be called after refresh")
+	}
+
+	payload := string(refreshed.Payload)
+	if !strings.Contains(payload, "MUSIC_U=existing-music-u") {
+		t.Fatalf("refreshed payload missing preserved MUSIC_U: %s", payload)
+	}
+	if !strings.Contains(payload, "__csrf=new-refreshed-csrf") {
+		t.Fatalf("refreshed payload missing new __csrf: %s", payload)
+	}
+}
+
+func TestNativeClient_RefreshToken_Unauthenticated(t *testing.T) {
+	t.Parallel()
+	client, err := NewNativeClient("https://music.163.com", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.RefreshToken(context.Background(), source.Session{})
+	if !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("expected ErrUnauthenticated for empty session, got %v", err)
+	}
+}
+
+type mockSessionStore struct {
+	savedSession source.Session
+	saveCalled   bool
+}
+
+func (m *mockSessionStore) Load(context.Context, string) (source.Session, error) {
+	return m.savedSession, nil
+}
+
+func (m *mockSessionStore) Save(_ context.Context, _ string, s source.Session) error {
+	m.savedSession = s
+	m.saveCalled = true
+	return nil
+}
+
+func TestAdapter_RefreshSession_PersistsToStore(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/login/token/refresh":
+			http.SetCookie(w, &http.Cookie{
+				Name:  "__csrf",
+				Value: "refreshed-csrf-store-test",
+				Path:  "/",
+			})
+			writeJSON(w, `{"code":200}`)
+		case "/api/nuser/account/get":
+			writeJSON(w, `{"code":200,"account":{"id":888,"userName":"storeUser"},"profile":{"userId":888,"nickname":"StoreUser"}}`)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	native, err := NewNativeClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{
+		baseURL:    native.baseURL,
+		httpClient: server.Client(),
+		native:     native,
+	}
+
+	store := &mockSessionStore{
+		savedSession: source.Session{Payload: []byte("MUSIC_U=store-u; __csrf=old-csrf")},
+	}
+	adapter, err := NewAdapter(client, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newSession, err := adapter.RefreshSession(context.Background(), store.savedSession)
+	if err != nil {
+		t.Fatalf("unexpected error refreshing session in adapter: %v", err)
+	}
+	if !store.saveCalled {
+		t.Fatal("expected adapter.RefreshSession to persist updated session to SessionStore")
+	}
+	if string(store.savedSession.Payload) != string(newSession.Payload) {
+		t.Fatalf("stored session payload mismatch: %s vs %s", store.savedSession.Payload, newSession.Payload)
+	}
+	if !strings.Contains(string(store.savedSession.Payload), "__csrf=refreshed-csrf-store-test") {
+		t.Fatalf("stored session missing new CSRF: %s", store.savedSession.Payload)
+	}
+}
+

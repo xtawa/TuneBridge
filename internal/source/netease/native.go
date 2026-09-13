@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-musicfox/netease-music/service"
+	"github.com/go-musicfox/netease-music/util"
 	"github.com/skip2/go-qrcode"
 	"github.com/xtawa/tunebridge/internal/source"
 )
@@ -63,32 +65,95 @@ func NewNativeClient(customBaseURL string, httpClient *http.Client) (*NativeClie
 		httpClient.Jar = jar
 	}
 
-	return &NativeClient{
+	client := &NativeClient{
 		baseURL:    parsed,
 		httpClient: httpClient,
 		jar:        jar,
-	}, nil
+	}
+	client.applyAntiRiskStrategy()
+	return client, nil
 }
 
 func (c *NativeClient) ID() string { return SourceID }
 
+func (c *NativeClient) isCustomURL() bool {
+	return c.baseURL != nil && c.baseURL.String() != DefaultNeteaseBaseURL
+}
+
+func (c *NativeClient) applyAntiRiskStrategy() {
+	util.SetGlobalCookieJar(c.jar)
+	sDevID := util.CheckSDeviceId(c.jar)
+	if sDevID == "" {
+		sDevID = util.GenerateSDeviceId()
+	}
+	cookieMap := map[string]string{
+		"sDeviceId": sDevID,
+		"os":        "pc",
+	}
+	util.AddCookiesToJar(c.jar, cookieMap, DefaultNeteaseBaseURL)
+	if c.isCustomURL() {
+		c.jar.SetCookies(c.baseURL, []*http.Cookie{
+			{Name: "sDeviceId", Value: sDevID, Path: "/"},
+			{Name: "os", Value: "pc", Path: "/"},
+		})
+	}
+	util.ApplyRequestStrategy(c.jar)
+}
+
 // CreateQRCode requests a new QR key from music.163.com and generates a PNG QR code image.
+// It automatically attaches the anti-risk chainId parameter to the QR code URL.
 func (c *NativeClient) CreateQRCode(ctx context.Context) (source.QRCode, error) {
-	var keyResponse struct {
-		Code   int    `json:"code"`
-		UniKey string `json:"unikey"`
-		Msg    string `json:"msg"`
+	if ctx.Err() != nil {
+		return source.QRCode{}, ctx.Err()
 	}
 
-	form := url.Values{"type": {"1"}}
-	if _, err := c.postForm(ctx, "/api/login/qrcode/unikey", form, &keyResponse); err != nil {
-		return source.QRCode{}, err
-	}
-	if keyResponse.Code != http.StatusOK || keyResponse.UniKey == "" {
-		return source.QRCode{}, apiError(keyResponse.Code, keyResponse.Msg)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.applyAntiRiskStrategy()
+
+	var key string
+	var qrURL string
+
+	if !c.isCustomURL() {
+		qrService := &service.LoginQRService{}
+		codeF, _, rawURL, err := qrService.GetKey()
+		if err != nil {
+			return source.QRCode{}, fmt.Errorf("create QR key: %w", err)
+		}
+		if int(codeF) != http.StatusOK || qrService.UniKey == "" {
+			return source.QRCode{}, fmt.Errorf("create QR key returned code %d", int(codeF))
+		}
+		key = qrService.UniKey
+		qrURL = rawURL
+		if strings.HasPrefix(qrURL, "http://") {
+			qrURL = "https://" + strings.TrimPrefix(qrURL, "http://")
+		}
+		if !strings.Contains(qrURL, "chainId=") {
+			chainID := util.GenerateChainID(c.jar)
+			if strings.Contains(qrURL, "?") {
+				qrURL += "&chainId=" + chainID
+			} else {
+				qrURL += "?chainId=" + chainID
+			}
+		}
+	} else {
+		var keyResponse struct {
+			Code   int    `json:"code"`
+			UniKey string `json:"unikey"`
+			Msg    string `json:"msg"`
+		}
+		form := url.Values{"type": {"1"}}
+		if _, err := c.postForm(ctx, "/api/login/qrcode/unikey", form, &keyResponse); err != nil {
+			return source.QRCode{}, err
+		}
+		if keyResponse.Code != http.StatusOK || keyResponse.UniKey == "" {
+			return source.QRCode{}, apiError(keyResponse.Code, keyResponse.Msg)
+		}
+		key = keyResponse.UniKey
+		chainID := util.GenerateChainID(c.jar)
+		qrURL = fmt.Sprintf("https://music.163.com/login?codekey=%s&chainId=%s", key, chainID)
 	}
 
-	qrURL := fmt.Sprintf("https://music.163.com/login?codekey=%s", keyResponse.UniKey)
 	pngBytes, err := qrcode.Encode(qrURL, qrcode.Medium, 256)
 	if err != nil {
 		return source.QRCode{}, fmt.Errorf("encode QR code image: %w", err)
@@ -96,7 +161,7 @@ func (c *NativeClient) CreateQRCode(ctx context.Context) (source.QRCode, error) 
 	imageData := "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngBytes)
 
 	return source.QRCode{
-		Key:       keyResponse.UniKey,
+		Key:       key,
 		URL:       qrURL,
 		ImageData: imageData,
 	}, nil
@@ -105,26 +170,62 @@ func (c *NativeClient) CreateQRCode(ctx context.Context) (source.QRCode, error) 
 // CheckQRCode polls the status of a QR login key, performs secondary verification
 // in the same CookieJar upon code 803, and returns the session.
 func (c *NativeClient) CheckQRCode(ctx context.Context, key string) (source.QRLoginStatus, source.Session, error) {
+	if ctx.Err() != nil {
+		return "", source.Session{}, ctx.Err()
+	}
 	if strings.TrimSpace(key) == "" {
 		return "", source.Session{}, errors.New("QR login key is required")
 	}
 
-	var response struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-		Cookie  string `json:"cookie"`
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.applyAntiRiskStrategy()
+
+	var code int
+	var message string
+	var cookieFromResp string
+
+	if !c.isCustomURL() {
+		qrService := &service.LoginQRService{UniKey: key}
+		codeF, bodyBytes, err := qrService.CheckQR()
+		if err != nil {
+			return "", source.Session{}, err
+		}
+		code = int(codeF)
+		if len(bodyBytes) > 0 {
+			var bodyData struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+				Cookie  string `json:"cookie"`
+			}
+			if err := json.Unmarshal(bodyBytes, &bodyData); err == nil {
+				message = bodyData.Message
+				cookieFromResp = bodyData.Cookie
+			}
+		}
+	} else {
+		var response struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+			Cookie  string `json:"cookie"`
+		}
+		form := url.Values{
+			"type": {"1"},
+			"key":  {key},
+		}
+		header, err := c.postForm(ctx, "/api/login/qrcode/client/login", form, &response)
+		if err != nil {
+			return "", source.Session{}, err
+		}
+		code = response.Code
+		message = response.Message
+		cookieFromResp = response.Cookie
+		if setCookies := header.Values("Set-Cookie"); len(setCookies) > 0 {
+			c.populateJarFromSetCookie(setCookies)
+		}
 	}
 
-	form := url.Values{
-		"type": {"1"},
-		"key":  {key},
-	}
-	header, err := c.postForm(ctx, "/api/login/qrcode/client/login", form, &response)
-	if err != nil {
-		return "", source.Session{}, err
-	}
-
-	switch response.Code {
+	switch code {
 	case 800:
 		return source.QRLoginExpired, source.Session{}, nil
 	case 801:
@@ -134,28 +235,37 @@ func (c *NativeClient) CheckQRCode(ctx context.Context, key string) (source.QRLo
 	case 804:
 		return "", source.Session{}, errors.New("authorization cancelled by user")
 	case 803:
-		// Succeeded: extract cookies from Jar or Set-Cookie headers
-		c.mu.Lock()
-		defer c.mu.Unlock()
-
-		// Merge cookies from Set-Cookie or response body if any
-		if response.Cookie != "" {
-			c.populateJarFromCookieString(response.Cookie)
-		}
-		if setCookies := header.Values("Set-Cookie"); len(setCookies) > 0 {
-			c.populateJarFromSetCookie(setCookies)
+		if cookieFromResp != "" {
+			c.populateJarFromCookieString(cookieFromResp)
 		}
 
-		// Perform secondary verification using the same CookieJar
-		profile, err := c.verifyAccountInJar(ctx)
-		if err != nil {
-			return "", source.Session{}, fmt.Errorf("secondary verification failed: %w", err)
+		var profile source.UserProfile
+		if !c.isCustomURL() {
+			accountService := &service.UserAccountService{}
+			accCode, accBody := accountService.AccountInfo()
+			if int(accCode) != http.StatusOK {
+				return "", source.Session{}, fmt.Errorf("secondary verification failed: code %d", int(accCode))
+			}
+			var accResp accountResponse
+			if err := json.Unmarshal(accBody, &accResp); err != nil {
+				return "", source.Session{}, fmt.Errorf("secondary verification failed: %w", err)
+			}
+			var pErr error
+			profile, pErr = extractProfile(&accResp)
+			if pErr != nil {
+				return "", source.Session{}, fmt.Errorf("secondary verification failed: %w", pErr)
+			}
+		} else {
+			var err error
+			profile, err = c.verifyAccountInJar(ctx)
+			if err != nil {
+				return "", source.Session{}, fmt.Errorf("secondary verification failed: %w", err)
+			}
 		}
 		if profile.ID == "" {
 			return "", source.Session{}, errors.New("secondary verification failed: user account not found")
 		}
 
-		// Extract final session cookie string
 		cookieStr := c.cookieStringFromJar()
 		if !strings.Contains(cookieStr, "MUSIC_U") {
 			return "", source.Session{}, errors.New("QR login succeeded without MUSIC_U cookie")
@@ -165,7 +275,7 @@ func (c *NativeClient) CheckQRCode(ctx context.Context, key string) (source.QRLo
 			Payload: []byte(cookieStr),
 		}, nil
 	default:
-		return "", source.Session{}, apiError(response.Code, response.Message)
+		return "", source.Session{}, apiError(code, message)
 	}
 }
 
@@ -180,7 +290,27 @@ func (c *NativeClient) VerifyCookie(ctx context.Context, rawCookie string) (sour
 		return source.Session{}, errors.New("cookie is missing MUSIC_U")
 	}
 
-	profile, err := c.verifyAccountWithCookie(ctx, normalized)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.populateJarFromCookieString(normalized)
+	c.applyAntiRiskStrategy()
+
+	var profile source.UserProfile
+	var err error
+	if !c.isCustomURL() {
+		accountService := &service.UserAccountService{}
+		accCode, accBody := accountService.AccountInfo()
+		if int(accCode) != http.StatusOK {
+			return source.Session{}, fmt.Errorf("cookie verification failed: code %d", int(accCode))
+		}
+		var accResp accountResponse
+		if err := json.Unmarshal(accBody, &accResp); err != nil {
+			return source.Session{}, fmt.Errorf("cookie verification failed: %w", err)
+		}
+		profile, err = extractProfile(&accResp)
+	} else {
+		profile, err = c.verifyAccountWithCookie(ctx, normalized)
+	}
 	if err != nil {
 		return source.Session{}, fmt.Errorf("cookie verification failed: %w", err)
 	}
@@ -190,6 +320,92 @@ func (c *NativeClient) VerifyCookie(ctx context.Context, rawCookie string) (sour
 
 	return source.Session{
 		Payload: []byte(normalized),
+	}, nil
+}
+
+// RefreshToken invokes Netease token refresh and returns the refreshed session.
+func (c *NativeClient) RefreshToken(ctx context.Context, currentSession source.Session) (source.Session, error) {
+	if ctx.Err() != nil {
+		return source.Session{}, ctx.Err()
+	}
+	if len(currentSession.Payload) == 0 {
+		return source.Session{}, ErrUnauthenticated
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.populateJarFromCookieString(string(currentSession.Payload))
+	c.applyAntiRiskStrategy()
+
+	if !c.isCustomURL() {
+		refreshService := &service.LoginRefreshService{}
+		codeF, bodyBytes, err := refreshService.LoginRefresh()
+		if err != nil {
+			return source.Session{}, fmt.Errorf("token refresh failed: %w", err)
+		}
+		if int(codeF) != http.StatusOK {
+			return source.Session{}, apiError(int(codeF), "token refresh failed")
+		}
+		if len(bodyBytes) > 0 {
+			var resp struct {
+				Code   int    `json:"code"`
+				Cookie string `json:"cookie"`
+			}
+			if err := json.Unmarshal(bodyBytes, &resp); err == nil && resp.Cookie != "" {
+				c.populateJarFromCookieString(resp.Cookie)
+			}
+		}
+	} else {
+		var resp struct {
+			Code   int    `json:"code"`
+			Cookie string `json:"cookie"`
+		}
+		header, err := c.postForm(ctx, "/api/login/token/refresh", nil, &resp)
+		if err != nil {
+			return source.Session{}, err
+		}
+		if resp.Code != http.StatusOK {
+			return source.Session{}, apiError(resp.Code, "token refresh failed")
+		}
+		if resp.Cookie != "" {
+			c.populateJarFromCookieString(resp.Cookie)
+		}
+		if setCookies := header.Values("Set-Cookie"); len(setCookies) > 0 {
+			c.populateJarFromSetCookie(setCookies)
+		}
+	}
+
+	newCookie := c.cookieStringFromJar()
+	if !strings.Contains(newCookie, "MUSIC_U") {
+		newCookie = MergeCookies(string(currentSession.Payload), newCookie)
+	}
+
+	var profile source.UserProfile
+	var err error
+	if !c.isCustomURL() {
+		accountService := &service.UserAccountService{}
+		accCode, accBody := accountService.AccountInfo()
+		if int(accCode) != http.StatusOK {
+			return source.Session{}, fmt.Errorf("verify refreshed session failed: code %d", int(accCode))
+		}
+		var accResp accountResponse
+		if err := json.Unmarshal(accBody, &accResp); err != nil {
+			return source.Session{}, fmt.Errorf("verify refreshed session failed: %w", err)
+		}
+		profile, err = extractProfile(&accResp)
+	} else {
+		profile, err = c.verifyAccountInJar(ctx)
+	}
+	if err != nil {
+		return source.Session{}, fmt.Errorf("verify refreshed session failed: %w", err)
+	}
+	if profile.ID == "" {
+		return source.Session{}, errors.New("verify refreshed session failed: user account not found")
+	}
+
+	return source.Session{
+		Payload: []byte(newCookie),
 	}, nil
 }
 
@@ -215,6 +431,35 @@ func NormalizeCookie(raw string) string {
 	return strings.Join(valid, "; ")
 }
 
+// MergeCookies merges two cookie strings without losing existing attributes.
+func MergeCookies(base, override string) string {
+	cookieMap := make(map[string]string)
+	for _, part := range strings.Split(base, ";") {
+		k, v, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if ok && k != "" {
+			cookieMap[k] = v
+		}
+	}
+	for _, part := range strings.Split(override, ";") {
+		k, v, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if ok && k != "" {
+			cookieMap[k] = v
+		}
+	}
+	parts := make([]string, 0, len(cookieMap))
+	for k, v := range cookieMap {
+		parts = append(parts, fmt.Sprintf("%s=%s", k, v))
+	}
+	return strings.Join(parts, "; ")
+}
+
+func sanitizeMessage(msg string) string {
+	if strings.Contains(msg, "MUSIC_U") || strings.Contains(msg, "__csrf") {
+		return "authentication failed"
+	}
+	return msg
+}
+
 type accountResponse struct {
 	Code    int `json:"code"`
 	Account *struct {
@@ -229,19 +474,10 @@ type accountResponse struct {
 	Message string `json:"message"`
 }
 
-func (c *NativeClient) verifyAccountInJar(ctx context.Context) (source.UserProfile, error) {
-	var resp accountResponse
-	_, err := c.postForm(ctx, "/api/nuser/account/get", nil, &resp)
-	if err != nil {
-		return source.UserProfile{}, err
-	}
-	if resp.Code != http.StatusOK {
-		return source.UserProfile{}, apiError(resp.Code, resp.Message)
-	}
-	if resp.Account == nil && resp.Profile == nil {
+func extractProfile(resp *accountResponse) (source.UserProfile, error) {
+	if resp == nil || (resp.Account == nil && resp.Profile == nil) {
 		return source.UserProfile{}, errors.New("no account profile returned")
 	}
-
 	var userID string
 	var nickname string
 	if resp.Profile != nil {
@@ -252,11 +488,22 @@ func (c *NativeClient) verifyAccountInJar(ctx context.Context) (source.UserProfi
 		userID = resp.Account.ID.String()
 		nickname = resp.Account.UserName
 	}
-
 	return source.UserProfile{
 		ID:          userID,
 		DisplayName: nickname,
 	}, nil
+}
+
+func (c *NativeClient) verifyAccountInJar(ctx context.Context) (source.UserProfile, error) {
+	var resp accountResponse
+	_, err := c.postForm(ctx, "/api/nuser/account/get", nil, &resp)
+	if err != nil {
+		return source.UserProfile{}, err
+	}
+	if resp.Code != http.StatusOK {
+		return source.UserProfile{}, apiError(resp.Code, resp.Message)
+	}
+	return extractProfile(&resp)
 }
 
 func (c *NativeClient) verifyAccountWithCookie(ctx context.Context, cookie string) (source.UserProfile, error) {
@@ -289,25 +536,11 @@ func (c *NativeClient) verifyAccountWithCookie(ctx context.Context, cookie strin
 	if resp.Code != http.StatusOK {
 		return source.UserProfile{}, apiError(resp.Code, resp.Message)
 	}
-	if resp.Account == nil && resp.Profile == nil {
-		return source.UserProfile{}, errors.New("no account profile returned")
-	}
+	return extractProfile(&resp)
+}
 
-	var userID string
-	var nickname string
-	if resp.Profile != nil {
-		userID = resp.Profile.UserID.String()
-		nickname = resp.Profile.Nickname
-	}
-	if userID == "" && resp.Account != nil {
-		userID = resp.Account.ID.String()
-		nickname = resp.Account.UserName
-	}
-
-	return source.UserProfile{
-		ID:          userID,
-		DisplayName: nickname,
-	}, nil
+func (c *NativeClient) UserProfile(ctx context.Context, cookie string) (source.UserProfile, error) {
+	return c.verifyAccountWithCookie(ctx, cookie)
 }
 
 func (c *NativeClient) postForm(ctx context.Context, endpoint string, form url.Values, target any) (http.Header, error) {
@@ -349,6 +582,10 @@ func (c *NativeClient) postForm(ctx context.Context, endpoint string, form url.V
 
 func (c *NativeClient) cookieStringFromJar() string {
 	cookies := c.jar.Cookies(c.baseURL)
+	if len(cookies) == 0 && c.isCustomURL() {
+		parsedDefault, _ := url.Parse(DefaultNeteaseBaseURL)
+		cookies = c.jar.Cookies(parsedDefault)
+	}
 	parts := make([]string, 0, len(cookies))
 	for _, ck := range cookies {
 		if ck.Name != "" && ck.Value != "" {
@@ -362,6 +599,8 @@ func (c *NativeClient) populateJarFromSetCookie(setCookies []string) {
 	dummyReq := &http.Response{Header: http.Header{"Set-Cookie": setCookies}}
 	parsedCookies := dummyReq.Cookies()
 	c.jar.SetCookies(c.baseURL, parsedCookies)
+	defaultURL, _ := url.Parse(DefaultNeteaseBaseURL)
+	c.jar.SetCookies(defaultURL, parsedCookies)
 }
 
 func (c *NativeClient) populateJarFromCookieString(raw string) {
@@ -378,5 +617,7 @@ func (c *NativeClient) populateJarFromCookieString(raw string) {
 	}
 	if len(cookies) > 0 {
 		c.jar.SetCookies(c.baseURL, cookies)
+		defaultURL, _ := url.Parse(DefaultNeteaseBaseURL)
+		c.jar.SetCookies(defaultURL, cookies)
 	}
 }
