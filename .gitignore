@@ -1,0 +1,17 @@
+# Runtime state and secrets
+data/
+*.db
+*.db-shm
+*.db-wal
+.env
+
+# Build output
+bin/
+dist/
+coverage.out
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

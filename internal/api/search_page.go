@@ -1,0 +1,22 @@
+package api
+
+import "net/http"
+
+// NewSearchPageHandler is intentionally dependency-free: the page is a small
+// same-origin companion to OnePlayer, not a management-console framework.
+func NewSearchPageHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write([]byte(searchPage))
+	})
+}
+
+const searchPage = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#121212"><meta name="apple-mobile-web-app-capable" content="yes"><title>TuneBridge 搜索</title><style>
+:root{color-scheme:light dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}body{margin:0;background:#f5f5f7;color:#171719}main{max-width:680px;margin:auto;padding:22px 16px 48px}h1{margin:6px 0;font-size:28px}.sub{color:#666;margin:0 0 20px}form{display:flex;gap:9px}input,button{font:inherit;border-radius:14px;border:0;padding:14px}input{min-width:0;flex:1;background:#fff;box-shadow:0 1px 4px #0001}button{background:#007aff;color:#fff;font-weight:650;min-height:48px}button:disabled{opacity:.5}#status{min-height:24px;margin:16px 2px;color:#666}.track{display:flex;gap:12px;align-items:center;padding:12px 0;border-bottom:1px solid #0001}.cover{width:58px;height:58px;border-radius:10px;object-fit:cover;background:#ddd}.trackInfo{min-width:0;flex:1}.title,.details{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.details{color:#666;font-size:14px;margin-top:4px}.add{padding:10px 12px;min-height:42px;white-space:nowrap}.secondary{background:#666;margin-top:10px}@media(prefers-color-scheme:dark){body{background:#121212;color:#f5f5f7}input{background:#242426;color:#fff}.sub,#status,.details{color:#aaa}.track{border-color:#fff2}.cover{background:#333}}
+</style></head><body><main><h1>TuneBridge</h1><p class="sub">搜索网易云音乐，加入 OnePlayer 的“搜索结果”。</p><form id="form"><input id="query" maxlength="200" required autocomplete="off" placeholder="搜索网易云音乐" aria-label="搜索网易云音乐"><button id="submit">搜索</button></form><div id="status" role="status"></div><section id="results" aria-live="polite"></section><button id="clear" class="secondary" hidden>清空 OnePlayer 搜索结果</button></main><script>
+const status=document.querySelector('#status'),results=document.querySelector('#results'),submit=document.querySelector('#submit'),clear=document.querySelector('#clear');
+function say(t){status.textContent=t}function req(path,init={}){return fetch(path,{credentials:'same-origin',...init})}function button(label,fn){const b=document.createElement('button');b.className='add';b.textContent=label;b.onclick=fn;return b}
+document.querySelector('#form').onsubmit=async e=>{e.preventDefault();const q=document.querySelector('#query').value.trim();if(!q)return;results.replaceChildren();clear.hidden=true;submit.disabled=true;say('正在搜索…');try{const r=await req('/api/search?q='+encodeURIComponent(q));if(!r.ok)throw Error();const data=await r.json();say(data.tracks.length?'找到 '+data.tracks.length+' 首歌曲':'没有找到结果');data.tracks.forEach(t=>{const row=document.createElement('article');row.className='track';const image=document.createElement('img');image.className='cover';image.alt='';image.src=t.cover_path;image.onerror=()=>image.removeAttribute('src');const info=document.createElement('div');info.className='trackInfo';const title=document.createElement('div');title.className='title';title.textContent=t.title;const details=document.createElement('div');details.className='details';details.textContent=(t.artists||[]).join('、')+(t.album?' · '+t.album:'');info.append(title,details);const add=button('加入',async()=>{add.disabled=true;try{const r=await req('/api/search-results',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({track_id:t.id})});if(!r.ok)throw Error();add.textContent='已加入';clear.hidden=false;say('已加入 OnePlayer 搜索结果，刷新 WebDAV 后可见。')}catch{add.disabled=false;say('加入失败，请重试。')}});row.append(image,info,add);results.append(row)});clear.hidden=!data.tracks.length}catch{say('搜索失败，请检查登录状态和上游服务。')}finally{submit.disabled=false}};
+clear.onclick=async()=>{if(!confirm('清空所有搜索结果？'))return;clear.disabled=true;try{const r=await req('/api/search-results',{method:'DELETE'});if(!r.ok)throw Error();say('已清空搜索结果。');clear.hidden=true}catch{say('清空失败，请重试。')}finally{clear.disabled=false}};
+</script></body></html>`
