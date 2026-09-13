@@ -51,6 +51,10 @@ func NewProxy(src source.MusicSource, quality source.Quality, client *http.Clien
 	return &Proxy{source: src, quality: quality, http: client, cache: audioCache, descriptors: make(map[string]cachedDescriptor), fills: make(map[string]chan struct{})}, nil
 }
 
+func (p *Proxy) Quality() source.Quality {
+	return p.quality
+}
+
 func (p *Proxy) activePopulation(key string) (chan struct{}, bool) {
 	p.fillMu.Lock()
 	defer p.fillMu.Unlock()
@@ -174,7 +178,7 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, id model.TrackIden
 	if requested != nil {
 		start, end = requested.Start, requested.End
 	}
-	cacheAll := requested == nil && start == 0
+	cacheAll := start == 0 && (requested == nil || requested.End == desc.Size-1)
 	if cacheAll {
 		done, alreadyFilling := p.startPopulation(key)
 		if alreadyFilling {
@@ -185,12 +189,21 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, id model.TrackIden
 				return r.Context().Err()
 			case <-done:
 				return p.Serve(w, r, id, desc)
+			case <-time.After(300 * time.Millisecond):
+				cacheAll = false
 			}
+		} else {
+			defer p.completePopulation(key, done)
 		}
-		defer p.completePopulation(key, done)
 	}
 
-	response, active, err := p.openWithRefresh(r.Context(), id, desc, start, end)
+	upstreamCtx := r.Context()
+	var cancelUpstream context.CancelFunc
+	if cacheAll {
+		upstreamCtx, cancelUpstream = context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancelUpstream()
+	}
+	response, active, err := p.openWithRefresh(upstreamCtx, id, desc, start, end)
 	if err != nil {
 		return fmt.Errorf("open upstream audio: %w", err)
 	}
@@ -216,12 +229,12 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, id model.TrackIden
 			// A premature body EOF/reset is retryable only through a fresh provider
 			// resolution. Reusing a stale signed URL can repeatedly truncate the
 			// response and never exercises the provider's URL refresh contract.
-			refreshed, refreshErr := p.refresh(r.Context(), id, desc)
+			refreshed, refreshErr := p.refresh(upstreamCtx, id, desc)
 			if refreshErr != nil {
 				copyErr = refreshErr
 				break
 			}
-			response, active, err = p.openWithRefresh(r.Context(), id, refreshed, start+written, end)
+			response, active, err = p.openWithRefresh(upstreamCtx, id, refreshed, start+written, end)
 			if err != nil {
 				copyErr = err
 				break
@@ -246,22 +259,20 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, id model.TrackIden
 			break
 		}
 		copyErr = err
-		if r.Context().Err() != nil {
+		if written == end-start+1 {
 			break
-		} // client disconnected: immediately stop upstream/cache work.
+		}
+		if r.Context().Err() != nil && cacheWriter == nil {
+			break
+		}
 	}
 	if partial != nil {
-		if syncErr := partial.Sync(); copyErr == nil {
-			copyErr = syncErr
-		}
-		if closeErr := partial.Close(); copyErr == nil {
-			copyErr = closeErr
-		}
-		if copyErr == nil && written == desc.Size {
-			if _, err := p.cache.Commit(r.Context(), partialPath, p.CacheKey(id, desc), desc.Format.ContentType, desc.Format.Codec, string(p.quality), desc.Size); err != nil {
-				return err
+		syncErr := partial.Sync()
+		closeErr := partial.Close()
+		if syncErr == nil && closeErr == nil && written == desc.Size {
+			if _, err := p.cache.Commit(context.Background(), partialPath, p.CacheKey(id, desc), desc.Format.ContentType, desc.Format.Codec, string(p.quality), desc.Size); err == nil {
+				partialPath = ""
 			}
-			partialPath = ""
 		}
 	}
 	if written != end-start+1 && copyErr == nil {
@@ -355,14 +366,50 @@ func copyUpstream(w io.Writer, cacheWriter io.Writer, response *http.Response, s
 	return copyExact(w, cacheWriter, response.Body, end-start+1)
 }
 
+type resilientDualWriter struct {
+	client      io.Writer
+	cache       io.Writer
+	clientError error
+	cacheError  error
+	cacheBytes  int64
+}
+
+func (d *resilientDualWriter) Write(p []byte) (int, error) {
+	if d.client != nil && d.clientError == nil {
+		if _, err := d.client.Write(p); err != nil {
+			d.clientError = err
+			d.client = nil
+		}
+	}
+	if d.cache != nil && d.cacheError == nil {
+		n, err := d.cache.Write(p)
+		d.cacheBytes += int64(n)
+		if err != nil {
+			d.cacheError = err
+			d.cache = nil
+		}
+		return n, err
+	}
+	if d.clientError != nil {
+		return 0, d.clientError
+	}
+	return len(p), nil
+}
+
 func copyExact(client io.Writer, cacheWriter io.Writer, source io.Reader, expected int64) (int64, error) {
 	var dst io.Writer = client
+	var dual *resilientDualWriter
 	if cacheWriter != nil {
-		dst = io.MultiWriter(client, cacheWriter)
+		dual = &resilientDualWriter{client: client, cache: cacheWriter}
+		dst = dual
 	}
-	written, err := io.CopyN(dst, source, expected)
+	buf := make([]byte, 128*1024)
+	written, err := io.CopyBuffer(dst, io.LimitReader(source, expected), buf)
 	if err != nil {
 		return written, fmt.Errorf("stream upstream audio: %w", err)
+	}
+	if dual != nil && dual.clientError != nil {
+		return written, dual.clientError
 	}
 	return written, nil
 }

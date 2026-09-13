@@ -93,6 +93,49 @@ func TestPlaylistFetchesMetadataThenTrackPages(t *testing.T) {
 	}
 }
 
+func TestTracksFromDTO_ExtractsQualityAndEstimatedSize(t *testing.T) {
+	t.Parallel()
+
+	items := []songDTO{
+		{
+			ID:   "1",
+			Name: "Lossless Track",
+			SQ:   &audioQualityDTO{Bitrate: 960000, Size: 32000000},
+			H:    &audioQualityDTO{Bitrate: 320000, Size: 10000000},
+		},
+		{
+			ID:   "2",
+			Name: "High MP3 Track",
+			H:    &audioQualityDTO{Bitrate: 320000, Size: 9500000},
+		},
+		{
+			ID:       "3",
+			Name:     "Fallback Track",
+			Duration: 200000,
+		},
+	}
+
+	tracks := tracksFromDTO(items)
+	if len(tracks) != 3 {
+		t.Fatalf("expected 3 tracks, got %d", len(tracks))
+	}
+
+	// Track 1: has SQ, so flac and 32MB
+	if tracks[0].EstimatedFormat.Extension != "flac" || tracks[0].EstimatedSize != 32000000 {
+		t.Fatalf("track 0 unexpected: format=%+v size=%d", tracks[0].EstimatedFormat, tracks[0].EstimatedSize)
+	}
+
+	// Track 2: only H, so mp3 and 9.5MB
+	if tracks[1].EstimatedFormat.Extension != "mp3" || tracks[1].EstimatedSize != 9500000 {
+		t.Fatalf("track 1 unexpected: format=%+v size=%d", tracks[1].EstimatedFormat, tracks[1].EstimatedSize)
+	}
+
+	// Track 3: fallback by duration
+	if tracks[2].EstimatedFormat.Extension != "mp3" || tracks[2].EstimatedSize <= 0 {
+		t.Fatalf("track 2 unexpected: format=%+v size=%d", tracks[2].EstimatedFormat, tracks[2].EstimatedSize)
+	}
+}
+
 type staticSession struct {
 	payload []byte
 	err     error

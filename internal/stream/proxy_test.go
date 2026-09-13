@@ -680,3 +680,132 @@ func TestProxy_RequestedRangeNotSatisfiable_416(t *testing.T) {
 		}
 	})
 }
+
+func TestProxy_RangeZeroPrefix_CachesFullTrackAndSubsequentRangeHitsCache(t *testing.T) {
+	t.Parallel()
+	f := setupProxyFixture(t)
+
+	desc, err := f.proxy.Describe(context.Background(), f.trackID)
+	if err != nil {
+		t.Fatalf("Describe failed: %v", err)
+	}
+
+	// 1. First request is typical mobile audio player request: Range: bytes=0-
+	req1 := httptest.NewRequest(http.MethodGet, "/track.flac", nil)
+	req1.Header.Set("Range", "bytes=0-")
+	rec1 := httptest.NewRecorder()
+
+	if err := f.proxy.Serve(rec1, req1, f.trackID, desc); err != nil {
+		t.Fatalf("Serve failed: %v", err)
+	}
+
+	if rec1.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", rec1.Code)
+	}
+	if !bytes.Equal(rec1.Body.Bytes(), f.payload) {
+		t.Fatalf("body length mismatch: got %d, want %d", rec1.Body.Len(), len(f.payload))
+	}
+	if hits := f.upstream.requestCount.Load(); hits != 1 {
+		t.Fatalf("upstream hits after request 1 = %d, want 1", hits)
+	}
+
+	// Verify track is now committed into cache!
+	entry, hit, err := f.cache.Lookup(context.Background(), f.proxy.CacheKey(f.trackID, desc))
+	if err != nil || !hit || entry.Size != int64(len(f.payload)) {
+		t.Fatalf("expected cache hit after bytes=0-, got hit=%v size=%d err=%v", hit, entry.Size, err)
+	}
+
+	// 2. Second request is player seeking or asking for next chunk: Range: bytes=500-
+	req2 := httptest.NewRequest(http.MethodGet, "/track.flac", nil)
+	req2.Header.Set("Range", "bytes=500-")
+	rec2 := httptest.NewRecorder()
+
+	if err := f.proxy.Serve(rec2, req2, f.trackID, desc); err != nil {
+		t.Fatalf("Serve request 2 failed: %v", err)
+	}
+
+	if rec2.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", rec2.Code)
+	}
+	if !bytes.Equal(rec2.Body.Bytes(), f.payload[500:]) {
+		t.Fatalf("body chunk mismatch: got %d, want %d", rec2.Body.Len(), len(f.payload[500:]))
+	}
+	// Upstream request count MUST remain 1 (served 100% from local disk!)
+	if hits := f.upstream.requestCount.Load(); hits != 1 {
+		t.Fatalf("upstream hits after request 2 = %d, want 1 (cache hit must not hit upstream)", hits)
+	}
+}
+
+type disconnectResponseWriter struct {
+	header      http.Header
+	written     bytes.Buffer
+	code        int
+	maxBeforeErr int
+}
+
+func (d *disconnectResponseWriter) Header() http.Header {
+	if d.header == nil {
+		d.header = make(http.Header)
+	}
+	return d.header
+}
+
+func (d *disconnectResponseWriter) WriteHeader(code int) {
+	d.code = code
+}
+
+func (d *disconnectResponseWriter) Write(p []byte) (int, error) {
+	if d.written.Len() >= d.maxBeforeErr {
+		return 0, errors.New("client disconnected")
+	}
+	remaining := d.maxBeforeErr - d.written.Len()
+	if len(p) <= remaining {
+		d.written.Write(p)
+		return len(p), nil
+	}
+	d.written.Write(p[:remaining])
+	return remaining, errors.New("client disconnected")
+}
+
+func TestProxy_ClientDisconnectEarly_StillCompletesCache(t *testing.T) {
+	t.Parallel()
+	f := setupProxyFixture(t)
+
+	desc, err := f.proxy.Describe(context.Background(), f.trackID)
+	if err != nil {
+		t.Fatalf("Describe failed: %v", err)
+	}
+
+	// Client only reads 200 bytes then disconnects
+	rw := &disconnectResponseWriter{maxBeforeErr: 200}
+	req := httptest.NewRequest(http.MethodGet, "/track.flac", nil)
+	req.Header.Set("Range", "bytes=0-")
+
+	_ = f.proxy.Serve(rw, req, f.trackID, desc)
+
+	// Even though client disconnected at 200 bytes, resilientDualWriter must have
+	// completed reading the remaining 800 bytes into the cache file and committed it!
+	entry, hit, err := f.cache.Lookup(context.Background(), f.proxy.CacheKey(f.trackID, desc))
+	if err != nil || !hit || entry.Size != int64(len(f.payload)) {
+		t.Fatalf("expected cache hit after client disconnect, got hit=%v size=%d err=%v", hit, entry.Size, err)
+	}
+
+	// Subsequent request for bytes 200- now hits local cache with zero upstream calls
+	req2 := httptest.NewRequest(http.MethodGet, "/track.flac", nil)
+	req2.Header.Set("Range", "bytes=200-")
+	rec2 := httptest.NewRecorder()
+
+	if err := f.proxy.Serve(rec2, req2, f.trackID, desc); err != nil {
+		t.Fatalf("Serve request 2 failed: %v", err)
+	}
+
+	if rec2.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", rec2.Code)
+	}
+	if !bytes.Equal(rec2.Body.Bytes(), f.payload[200:]) {
+		t.Fatalf("body mismatch: got %d, want %d", rec2.Body.Len(), len(f.payload[200:]))
+	}
+	if hits := f.upstream.requestCount.Load(); hits != 1 {
+		t.Fatalf("upstream hits after request 2 = %d, want 1", hits)
+	}
+}

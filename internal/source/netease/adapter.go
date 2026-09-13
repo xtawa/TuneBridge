@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-musicfox/netease-music/service"
@@ -613,14 +614,12 @@ func (a *Adapter) tracksByIDs(ctx context.Context, ids []string) ([]model.Track,
 			return nil, err
 		}
 		a.syncSDKCookie(cookie)
-		all := make([]model.Track, 0, len(ids))
-		for start := 0; start < len(ids); start += 500 {
-			end := start + 500
-			if end > len(ids) {
-				end = len(ids)
-			}
+
+		batchSize := 500
+		numBatches := (len(ids) + batchSize - 1) / batchSize
+		if numBatches == 1 {
 			songService := &service.SongDetailService{
-				Ids: strings.Join(ids[start:end], ","),
+				Ids: strings.Join(ids, ","),
 			}
 			code, body := songService.SongDetail()
 			if int(code) != http.StatusOK {
@@ -637,7 +636,65 @@ func (a *Adapter) tracksByIDs(ctx context.Context, ids []string) ([]model.Track,
 			if response.Code != http.StatusOK {
 				return nil, apiError(response.Code, response.Message)
 			}
-			all = append(all, tracksFromDTO(response.Songs)...)
+			return tracksFromDTO(response.Songs), nil
+		}
+
+		chunks := make([][]model.Track, numBatches)
+		errCh := make(chan error, numBatches)
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 4)
+
+		for b := 0; b < numBatches; b++ {
+			start := b * batchSize
+			end := start + batchSize
+			if end > len(ids) {
+				end = len(ids)
+			}
+			batchIDs := strings.Join(ids[start:end], ",")
+			batchIdx := b
+
+			wg.Add(1)
+			go func(idx int, idStr string) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				songService := &service.SongDetailService{
+					Ids: idStr,
+				}
+				code, body := songService.SongDetail()
+				if int(code) != http.StatusOK {
+					errCh <- apiError(int(code), "song detail failed")
+					return
+				}
+				var response struct {
+					Code    int       `json:"code"`
+					Songs   []songDTO `json:"songs"`
+					Message string    `json:"message"`
+				}
+				if err := json.Unmarshal(body, &response); err != nil {
+					errCh <- fmt.Errorf("decode song detail: %w", err)
+					return
+				}
+				if response.Code != http.StatusOK {
+					errCh <- apiError(response.Code, response.Message)
+					return
+				}
+				chunks[idx] = tracksFromDTO(response.Songs)
+			}(batchIdx, batchIDs)
+		}
+
+		wg.Wait()
+		close(errCh)
+		for e := range errCh {
+			if e != nil {
+				return nil, e
+			}
+		}
+
+		all := make([]model.Track, 0, len(ids))
+		for _, chunk := range chunks {
+			all = append(all, chunk...)
 		}
 		return all, nil
 	}
@@ -709,6 +766,11 @@ func (id *flexibleID) UnmarshalJSON(value []byte) error {
 }
 func (id flexibleID) String() string { return string(id) }
 
+type audioQualityDTO struct {
+	Bitrate int   `json:"br"`
+	Size    int64 `json:"size"`
+}
+
 type songDTO struct {
 	ID      flexibleID `json:"id"`
 	Name    string     `json:"name"`
@@ -728,7 +790,12 @@ type songDTO struct {
 		Name   string     `json:"name"`
 		PicURL string     `json:"picUrl"`
 	} `json:"album"`
-	Duration int64 `json:"dt"`
+	Duration int64            `json:"dt"`
+	H        *audioQualityDTO `json:"h"`
+	M        *audioQualityDTO `json:"m"`
+	L        *audioQualityDTO `json:"l"`
+	SQ       *audioQualityDTO `json:"sq"`
+	HR       *audioQualityDTO `json:"hr"`
 }
 
 func tracksFromDTO(items []songDTO) []model.Track {
@@ -751,7 +818,51 @@ func tracksFromDTO(items []songDTO) []model.Track {
 				names = append(names, artist.Name)
 			}
 		}
-		result = append(result, model.Track{Identity: model.TrackIdentity{SourceID: SourceID, TrackID: item.ID.String()}, Title: item.Name, Artists: names, AlbumID: album.ID.String(), AlbumTitle: album.Name, Duration: time.Duration(item.Duration) * time.Millisecond, Cover: model.Cover{URL: album.PicURL}})
+
+		ext := "mp3"
+		codec := "mp3"
+		br := 320
+		var estSize int64
+		if item.HR != nil && item.HR.Size > 0 {
+			ext = "flac"
+			codec = "flac"
+			br = item.HR.Bitrate / 1000
+			estSize = item.HR.Size
+		} else if item.SQ != nil && item.SQ.Size > 0 {
+			ext = "flac"
+			codec = "flac"
+			br = item.SQ.Bitrate / 1000
+			estSize = item.SQ.Size
+		} else if item.H != nil && item.H.Size > 0 {
+			ext = "mp3"
+			codec = "mp3"
+			br = item.H.Bitrate / 1000
+			estSize = item.H.Size
+		} else if item.M != nil && item.M.Size > 0 {
+			ext = "mp3"
+			codec = "mp3"
+			br = item.M.Bitrate / 1000
+			estSize = item.M.Size
+		} else if item.L != nil && item.L.Size > 0 {
+			ext = "mp3"
+			codec = "mp3"
+			br = item.L.Bitrate / 1000
+			estSize = item.L.Size
+		} else if item.Duration > 0 {
+			estSize = (item.Duration * 320) / 8
+		}
+
+		result = append(result, model.Track{
+			Identity:        model.TrackIdentity{SourceID: SourceID, TrackID: item.ID.String()},
+			Title:           item.Name,
+			Artists:         names,
+			AlbumID:         album.ID.String(),
+			AlbumTitle:      album.Name,
+			Duration:        time.Duration(item.Duration) * time.Millisecond,
+			Cover:           model.Cover{URL: album.PicURL},
+			EstimatedFormat: model.AudioFormat{Extension: ext, ContentType: contentType(ext), Codec: codec, BitrateKbps: br},
+			EstimatedSize:   estSize,
+		})
 	}
 	return result
 }

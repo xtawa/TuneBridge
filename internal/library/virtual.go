@@ -18,6 +18,7 @@ import (
 	"github.com/xtawa/tunebridge/internal/source/netease"
 	"github.com/xtawa/tunebridge/internal/stream"
 	"github.com/xtawa/tunebridge/internal/webdav"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -41,6 +42,7 @@ type VirtualLibrary struct {
 	mu        sync.Mutex
 	snapshots map[string]snapshot
 	lyrics    map[string]cachedLyrics
+	sf        singleflight.Group
 }
 
 type SearchResults interface {
@@ -165,6 +167,7 @@ func (l *VirtualLibrary) Head(ctx context.Context, resource webdav.Resource) (we
 			return resource, err
 		}
 		resource = l.audioResource(resource.Path, resource.Track, desc)
+		l.updateCachedResource(resource)
 	}
 	if resource.Kind == webdav.LyricsFile {
 		body, etag, err := l.lyricsBody(ctx, resource.Track)
@@ -229,22 +232,31 @@ func (l *VirtualLibrary) playlistIndex(ctx context.Context) (snapshot, error) {
 	if s, ok := l.snapshot(key); ok {
 		return s, nil
 	}
-	items, err := l.source.Playlists(ctx)
+	val, err, _ := l.sf.Do(key, func() (any, error) {
+		if s, ok := l.snapshot(key); ok {
+			return s, nil
+		}
+		items, err := l.source.Playlists(ctx)
+		if err != nil {
+			return snapshot{}, err
+		}
+		s := emptySnapshot()
+		s.resources[playlistsRoot] = collection(playlistsRoot)
+		used := make(map[string]bool)
+		for _, item := range items {
+			name := uniqueDirectoryName(item.Name, item.ID, used)
+			entry := collection(playlistsRoot + "/" + name)
+			s.resources[entry.Path] = entry
+			s.children[playlistsRoot] = append(s.children[playlistsRoot], entry)
+		}
+		sortResources(s.children[playlistsRoot])
+		l.store(key, s, l.playlistTTL)
+		return s, nil
+	})
 	if err != nil {
 		return snapshot{}, err
 	}
-	s := emptySnapshot()
-	s.resources[playlistsRoot] = collection(playlistsRoot)
-	used := make(map[string]bool)
-	for _, item := range items {
-		name := uniqueDirectoryName(item.Name, item.ID, used)
-		entry := collection(playlistsRoot + "/" + name)
-		s.resources[entry.Path] = entry
-		s.children[playlistsRoot] = append(s.children[playlistsRoot], entry)
-	}
-	sortResources(s.children[playlistsRoot])
-	l.store(key, s, l.playlistTTL)
-	return s, nil
+	return val.(snapshot), nil
 }
 
 func (l *VirtualLibrary) playlistSnapshot(ctx context.Context, directory string) (snapshot, error) {
@@ -260,33 +272,42 @@ func (l *VirtualLibrary) playlistSnapshot(ctx context.Context, directory string)
 	if s, ok := l.snapshot(key); ok {
 		return s, nil
 	}
-	// Names have an ID suffix only on a collision. Resolve the exact source
-	// playlist by comparing the generated directory names in current metadata.
-	items, err := l.source.Playlists(ctx)
-	if err != nil {
-		return snapshot{}, err
-	}
-	used := make(map[string]bool)
-	playlistID := ""
-	for _, item := range items {
-		if playlistsRoot+"/"+uniqueDirectoryName(item.Name, item.ID, used) == directory {
-			playlistID = item.ID
-			break
+	val, err, _ := l.sf.Do(key, func() (any, error) {
+		if s, ok := l.snapshot(key); ok {
+			return s, nil
 		}
-	}
-	if playlistID == "" {
-		return snapshot{}, webdav.ErrNotFound
-	}
-	_, tracks, err := l.source.Playlist(ctx, playlistID)
+		// Names have an ID suffix only on a collision. Resolve the exact source
+		// playlist by comparing the generated directory names in current metadata.
+		items, err := l.source.Playlists(ctx)
+		if err != nil {
+			return snapshot{}, err
+		}
+		used := make(map[string]bool)
+		playlistID := ""
+		for _, item := range items {
+			if playlistsRoot+"/"+uniqueDirectoryName(item.Name, item.ID, used) == directory {
+				playlistID = item.ID
+				break
+			}
+		}
+		if playlistID == "" {
+			return snapshot{}, webdav.ErrNotFound
+		}
+		_, tracks, err := l.source.Playlist(ctx, playlistID)
+		if err != nil {
+			return snapshot{}, err
+		}
+		s, err := l.makeTrackSnapshot(ctx, directory, tracks)
+		if err != nil {
+			return snapshot{}, err
+		}
+		l.store(key, s, l.playlistTTL)
+		return s, nil
+	})
 	if err != nil {
 		return snapshot{}, err
 	}
-	s, err := l.makeTrackSnapshot(ctx, directory, tracks)
-	if err != nil {
-		return snapshot{}, err
-	}
-	l.store(key, s, l.playlistTTL)
-	return s, nil
+	return val.(snapshot), nil
 }
 
 func (l *VirtualLibrary) trackSnapshot(ctx context.Context, directory string) (snapshot, error) {
@@ -294,45 +315,54 @@ func (l *VirtualLibrary) trackSnapshot(ctx context.Context, directory string) (s
 	if s, ok := l.snapshot(key); ok {
 		return s, nil
 	}
-	var tracks []model.Track
-	var err error
-	switch directory {
-	case likedRoot:
-		tracks, err = l.source.LikedTracks(ctx)
-	case dailyRoot:
-		tracks, err = l.source.DailyRecommendations(ctx)
-	case searchRoot:
-		if l.search == nil {
-			tracks = []model.Track{}
-			break
+	val, err, _ := l.sf.Do(key, func() (any, error) {
+		if s, ok := l.snapshot(key); ok {
+			return s, nil
 		}
-		identities, listErr := l.search.List(ctx, l.source.ID())
-		if listErr != nil {
-			return snapshot{}, listErr
-		}
-		tracks = make([]model.Track, 0, len(identities))
-		for _, identity := range identities {
-			track, trackErr := l.source.Track(ctx, identity)
-			if trackErr == nil {
-				tracks = append(tracks, track)
+		var tracks []model.Track
+		var err error
+		switch directory {
+		case likedRoot:
+			tracks, err = l.source.LikedTracks(ctx)
+		case dailyRoot:
+			tracks, err = l.source.DailyRecommendations(ctx)
+		case searchRoot:
+			if l.search == nil {
+				tracks = []model.Track{}
+				break
 			}
+			identities, listErr := l.search.List(ctx, l.source.ID())
+			if listErr != nil {
+				return snapshot{}, listErr
+			}
+			tracks = make([]model.Track, 0, len(identities))
+			for _, identity := range identities {
+				track, trackErr := l.source.Track(ctx, identity)
+				if trackErr == nil {
+					tracks = append(tracks, track)
+				}
+			}
+		default:
+			return snapshot{}, webdav.ErrNotFound
 		}
-	default:
-		return snapshot{}, webdav.ErrNotFound
-	}
+		if err != nil {
+			return snapshot{}, err
+		}
+		s, err := l.makeTrackSnapshot(ctx, directory, tracks)
+		if err != nil {
+			return snapshot{}, err
+		}
+		ttl := l.playlistTTL
+		if directory == dailyRoot {
+			ttl = l.dailyTTL
+		}
+		l.store(key, s, ttl)
+		return s, nil
+	})
 	if err != nil {
 		return snapshot{}, err
 	}
-	s, err := l.makeTrackSnapshot(ctx, directory, tracks)
-	if err != nil {
-		return snapshot{}, err
-	}
-	ttl := l.playlistTTL
-	if directory == dailyRoot {
-		ttl = l.dailyTTL
-	}
-	l.store(key, s, ttl)
-	return s, nil
+	return val.(snapshot), nil
 }
 
 func (l *VirtualLibrary) makeTrackSnapshot(ctx context.Context, directory string, tracks []model.Track) (snapshot, error) {
@@ -343,31 +373,94 @@ func (l *VirtualLibrary) makeTrackSnapshot(ctx context.Context, directory string
 	sorted := append([]model.Track(nil), tracks...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Identity.String() < sorted[j].Identity.String() })
 	used := make(map[string]bool)
-	var firstErr error
+
 	for _, track := range sorted {
-		desc, err := l.proxy.Describe(ctx, track.Identity)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
+		ext := track.EstimatedFormat.Extension
+		if ext == "" {
+			if l.proxy != nil && l.proxy.Quality() == source.QualityLossless {
+				ext = "flac"
+			} else {
+				ext = "mp3"
 			}
-			continue
-		} // unavailable tracks do not manufacture a false representation.
-		filename := AudioFilename(track, desc.Format.Extension)
+		} else if l.proxy != nil && l.proxy.Quality() != source.QualityLossless {
+			ext = "mp3"
+		}
+
+		cType := track.EstimatedFormat.ContentType
+		if cType == "" {
+			cType = contentTypeFromExtension(ext)
+		}
+
+		filename := AudioFilename(track, ext)
 		if used[filename] {
 			filename = CollisionFilename(filename, track.Identity)
 		}
 		used[filename] = true
-		audio := l.audioResource(directory+"/"+filename, track.Identity, desc)
-		lyrics := webdav.Resource{Path: directory + "/" + LyricsFilename(filename), Kind: webdav.LyricsFile, ContentType: "text/plain; charset=utf-8", Size: -1, ModifiedAt: track.UpdatedAt, Track: track.Identity}
+
+		size := track.EstimatedSize
+		if size <= 0 {
+			size = -1
+		}
+
+		audio := webdav.Resource{
+			Path:        directory + "/" + filename,
+			Kind:        webdav.AudioFile,
+			ContentType: cType,
+			Size:        size,
+			ModifiedAt:  track.UpdatedAt,
+			Track:       track.Identity,
+		}
+		lyrics := webdav.Resource{
+			Path:        directory + "/" + LyricsFilename(filename),
+			Kind:        webdav.LyricsFile,
+			ContentType: "text/plain; charset=utf-8",
+			Size:        -1,
+			ModifiedAt:  track.UpdatedAt,
+			Track:       track.Identity,
+		}
 		s.resources[audio.Path] = audio
 		s.resources[lyrics.Path] = lyrics
 		s.children[directory] = append(s.children[directory], audio, lyrics)
 	}
-	if len(tracks) > 0 && len(s.children[directory]) == 0 && firstErr != nil {
-		return snapshot{}, firstErr
-	}
+
 	sortResources(s.children[directory])
 	return s, nil
+}
+
+func contentTypeFromExtension(ext string) string {
+	switch strings.ToLower(strings.TrimPrefix(ext, ".")) {
+	case "flac":
+		return "audio/flac"
+	case "mp3":
+		return "audio/mpeg"
+	case "m4a", "aac":
+		return "audio/mp4"
+	case "ogg", "opus":
+		return "audio/ogg"
+	case "wav":
+		return "audio/wav"
+	default:
+		return "application/octet-stream"
+	}
+}
+
+func (l *VirtualLibrary) updateCachedResource(resource webdav.Resource) {
+	dir := path.Dir(resource.Path)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for key, s := range l.snapshots {
+		if _, ok := s.resources[resource.Path]; ok {
+			s.resources[resource.Path] = resource
+			for i, child := range s.children[dir] {
+				if child.Path == resource.Path {
+					s.children[dir][i] = resource
+					break
+				}
+			}
+			l.snapshots[key] = s
+			break
+		}
+	}
 }
 
 func (l *VirtualLibrary) audioResource(path string, id model.TrackIdentity, desc model.ResolvedStream) webdav.Resource {

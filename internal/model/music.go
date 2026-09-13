@@ -52,9 +52,11 @@ type Track struct {
 	Genre       string
 	ISRC        string
 	Duration    time.Duration
-	Cover       Cover
-	Lyrics      Lyrics
-	UpdatedAt   time.Time
+	Cover           Cover
+	Lyrics          Lyrics
+	UpdatedAt       time.Time
+	EstimatedFormat AudioFormat
+	EstimatedSize   int64
 }
 
 // AudioFormat is discovered from the resolved upstream stream. It is not a
