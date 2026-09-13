@@ -70,7 +70,7 @@ func NewNativeClient(customBaseURL string, httpClient *http.Client) (*NativeClie
 		httpClient: httpClient,
 		jar:        jar,
 	}
-	client.applyAntiRiskStrategy()
+	client.ensureSDeviceID()
 	return client, nil
 }
 
@@ -80,7 +80,7 @@ func (c *NativeClient) isCustomURL() bool {
 	return c.baseURL != nil && c.baseURL.String() != DefaultNeteaseBaseURL
 }
 
-func (c *NativeClient) applyAntiRiskStrategy() {
+func (c *NativeClient) ensureSDeviceID() {
 	util.SetGlobalCookieJar(c.jar)
 	sDevID := util.CheckSDeviceId(c.jar)
 	if sDevID == "" {
@@ -88,16 +88,13 @@ func (c *NativeClient) applyAntiRiskStrategy() {
 	}
 	cookieMap := map[string]string{
 		"sDeviceId": sDevID,
-		"os":        "pc",
 	}
 	util.AddCookiesToJar(c.jar, cookieMap, DefaultNeteaseBaseURL)
 	if c.isCustomURL() {
 		c.jar.SetCookies(c.baseURL, []*http.Cookie{
 			{Name: "sDeviceId", Value: sDevID, Path: "/"},
-			{Name: "os", Value: "pc", Path: "/"},
 		})
 	}
-	util.ApplyRequestStrategy(c.jar)
 }
 
 // CreateQRCode requests a new QR key from music.163.com and generates a PNG QR code image.
@@ -109,7 +106,7 @@ func (c *NativeClient) CreateQRCode(ctx context.Context) (source.QRCode, error) 
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.applyAntiRiskStrategy()
+	c.ensureSDeviceID()
 
 	var key string
 	var qrURL string
@@ -179,7 +176,7 @@ func (c *NativeClient) CheckQRCode(ctx context.Context, key string) (source.QRLo
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.applyAntiRiskStrategy()
+	c.ensureSDeviceID()
 
 	var code int
 	var message string
@@ -293,7 +290,7 @@ func (c *NativeClient) VerifyCookie(ctx context.Context, rawCookie string) (sour
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.populateJarFromCookieString(normalized)
-	c.applyAntiRiskStrategy()
+	c.ensureSDeviceID()
 
 	var profile source.UserProfile
 	var err error
@@ -336,7 +333,7 @@ func (c *NativeClient) RefreshToken(ctx context.Context, currentSession source.S
 	defer c.mu.Unlock()
 
 	c.populateJarFromCookieString(string(currentSession.Payload))
-	c.applyAntiRiskStrategy()
+	c.ensureSDeviceID()
 
 	if !c.isCustomURL() {
 		refreshService := &service.LoginRefreshService{}
