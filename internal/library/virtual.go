@@ -2,6 +2,8 @@ package library
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -37,6 +39,7 @@ type VirtualLibrary struct {
 
 	mu        sync.Mutex
 	snapshots map[string]snapshot
+	lyrics    map[string]cachedLyrics
 }
 
 type SearchResults interface {
@@ -47,6 +50,10 @@ type snapshot struct {
 	expires   time.Time
 	resources map[string]webdav.Resource
 	children  map[string][]webdav.Resource
+}
+type cachedLyrics struct {
+	body, etag string
+	expires    time.Time
 }
 
 func NewVirtualLibrary(src source.MusicSource, proxy *stream.Proxy, searchResults SearchResults, playlistTTL, dailyTTL time.Duration, lyricsMode string) (*VirtualLibrary, error) {
@@ -59,7 +66,7 @@ func NewVirtualLibrary(src source.MusicSource, proxy *stream.Proxy, searchResult
 	if lyricsMode != "original" && lyricsMode != "original_translation" && lyricsMode != "original_romanized" {
 		return nil, errors.New("unsupported lyrics mode")
 	}
-	return &VirtualLibrary{source: src, proxy: proxy, search: searchResults, playlistTTL: playlistTTL, dailyTTL: dailyTTL, lyricsMode: lyricsMode, snapshots: make(map[string]snapshot)}, nil
+	return &VirtualLibrary{source: src, proxy: proxy, search: searchResults, playlistTTL: playlistTTL, dailyTTL: dailyTTL, lyricsMode: lyricsMode, snapshots: make(map[string]snapshot), lyrics: make(map[string]cachedLyrics)}, nil
 }
 
 func (l *VirtualLibrary) Stat(ctx context.Context, resourcePath string) (webdav.Resource, error) {
@@ -149,6 +156,13 @@ func (l *VirtualLibrary) Head(ctx context.Context, resource webdav.Resource) (we
 		}
 		resource = l.audioResource(resource.Path, resource.Track, desc)
 	}
+	if resource.Kind == webdav.LyricsFile {
+		body, etag, err := l.lyricsBody(ctx, resource.Track)
+		if err != nil {
+			return resource, err
+		}
+		resource.Size, resource.ETag = int64(len([]byte(body))), etag
+	}
 	return resource, nil
 }
 
@@ -161,19 +175,43 @@ func (l *VirtualLibrary) Get(ctx context.Context, w http.ResponseWriter, r *http
 		}
 		return l.proxy.Serve(w, r, resource.Track, *resource.Representation)
 	case webdav.LyricsFile:
-		lyrics, err := l.source.Lyrics(ctx, resource.Track)
+		body, etag, err := l.lyricsBody(ctx, resource.Track)
 		if err != nil {
 			return err
 		}
-		body := selectLyrics(lyrics, l.lyricsMode)
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Content-Length", fmt.Sprint(len([]byte(body))))
+		w.Header().Set("ETag", etag)
+		if !resource.ModifiedAt.IsZero() {
+			w.Header().Set("Last-Modified", resource.ModifiedAt.UTC().Format(http.TimeFormat))
+		}
 		w.Header().Set("Cache-Control", "private, max-age=300")
 		_, err = w.Write([]byte(body))
 		return err
 	default:
 		return errors.New("unsupported virtual file")
 	}
+}
+
+func (l *VirtualLibrary) lyricsBody(ctx context.Context, id model.TrackIdentity) (string, string, error) {
+	key := id.String() + ":" + l.lyricsMode
+	l.mu.Lock()
+	cached, ok := l.lyrics[key]
+	l.mu.Unlock()
+	if ok && time.Now().Before(cached.expires) {
+		return cached.body, cached.etag, nil
+	}
+	lyrics, err := l.source.Lyrics(ctx, id)
+	if err != nil {
+		return "", "", err
+	}
+	body := selectLyrics(lyrics, l.lyricsMode)
+	hash := sha256.Sum256([]byte(body))
+	etag := `"` + hex.EncodeToString(hash[:16]) + `"`
+	l.mu.Lock()
+	l.lyrics[key] = cachedLyrics{body: body, etag: etag, expires: time.Now().Add(5 * time.Minute)}
+	l.mu.Unlock()
+	return body, etag, nil
 }
 
 func (l *VirtualLibrary) playlistIndex(ctx context.Context) (snapshot, error) {

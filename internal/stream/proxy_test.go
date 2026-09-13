@@ -3,6 +3,7 @@ package stream
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net/http"
@@ -424,6 +425,155 @@ func TestProxy_UpstreamIgnoresRange_ReturnsExactRequestedBytes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestProxy_ResumesAfterTruncatedUpstreamBodyAtExactOffset(t *testing.T) {
+	payload := bytes.Repeat([]byte("TuneBridge"), (5<<20)/len("TuneBridge"))
+	payload = payload[:5<<20]
+	const firstChunk = 1 << 20
+	var secondRange atomic.Value
+	var resolves atomic.Int64
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/first":
+			w.Header().Set("Content-Type", "audio/flac")
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(payload)-1, len(payload)))
+			w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(payload[:firstChunk]) // deliberately shorter than Content-Length
+		case "/second":
+			secondRange.Store(r.Header.Get("Range"))
+			got, err := ParseRange(r.Header.Get("Range"), int64(len(payload)))
+			if err != nil {
+				t.Errorf("second request Range: %v", err)
+				return
+			}
+			w.Header().Set("Content-Type", "audio/flac")
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", got.Start, got.End, len(payload)))
+			w.Header().Set("Content-Length", strconv.FormatInt(got.Length(), 10))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(payload[got.Start : got.End+1])
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	proxy, identity := customProxy(t, server.Client(), func(context.Context, model.TrackIdentity, source.Quality) (model.ResolvedStream, error) {
+		if resolves.Add(1) == 1 {
+			return testDescriptor(server.URL+"/first", int64(len(payload)), "flac", "audio/flac"), nil
+		}
+		return testDescriptor(server.URL+"/second", int64(len(payload)), "flac", "audio/flac"), nil
+	})
+	desc, err := proxy.Describe(context.Background(), identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/track.flac", nil)
+	if err := proxy.Serve(recorder, request, identity, desc); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if got := secondRange.Load(); got != "bytes=1048576-5242879" {
+		t.Fatalf("refresh Range = %v", got)
+	}
+	if resolves.Load() < 2 {
+		t.Fatalf("ResolveStream calls = %d, want refresh", resolves.Load())
+	}
+	if hash := sha256.Sum256(recorder.Body.Bytes()); hash != sha256.Sum256(payload) {
+		t.Fatal("resumed body hash differs from source")
+	}
+}
+
+func TestProxy_RejectsRepresentationMismatchAfterTruncation(t *testing.T) {
+	payload := bytes.Repeat([]byte("F"), 2<<20)
+	const firstChunk = 1 << 20
+	var resolves atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/first" {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(payload)-1, len(payload)))
+			w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(payload[:firstChunk])
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	proxy, identity := customProxy(t, server.Client(), func(context.Context, model.TrackIdentity, source.Quality) (model.ResolvedStream, error) {
+		if resolves.Add(1) == 1 {
+			return testDescriptor(server.URL+"/first", int64(len(payload)), "flac", "audio/flac"), nil
+		}
+		return testDescriptor(server.URL+"/second", 10<<20, "mp3", "audio/mpeg"), nil
+	})
+	desc, err := proxy.Describe(context.Background(), identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	err = proxy.Serve(recorder, httptest.NewRequest(http.MethodGet, "/track.flac", nil), identity, desc)
+	if err == nil || !strings.Contains(err.Error(), "representation differs") {
+		t.Fatalf("Serve error = %v, want representation mismatch", err)
+	}
+	if recorder.Header().Get("Content-Type") != "audio/flac" || recorder.Header().Get("Content-Length") != strconv.Itoa(len(payload)) {
+		t.Fatal("response representation changed after bytes were sent")
+	}
+	if !bytes.Equal(recorder.Body.Bytes(), payload[:firstChunk]) {
+		t.Fatal("mismatched representation bytes were appended")
+	}
+}
+
+func TestProxy_RejectsSameCodecDifferentSizeAfterTruncation(t *testing.T) {
+	payload := bytes.Repeat([]byte("F"), 2<<20)
+	const firstChunk = 1 << 20
+	var resolves atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(payload)-1, len(payload)))
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(payload[:firstChunk])
+	}))
+	defer server.Close()
+	proxy, identity := customProxy(t, server.Client(), func(context.Context, model.TrackIdentity, source.Quality) (model.ResolvedStream, error) {
+		if resolves.Add(1) == 1 {
+			return testDescriptor(server.URL, int64(len(payload)), "flac", "audio/flac"), nil
+		}
+		return testDescriptor(server.URL, int64(len(payload)+1), "flac", "audio/flac"), nil
+	})
+	desc, err := proxy.Describe(context.Background(), identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	err = proxy.Serve(recorder, httptest.NewRequest(http.MethodGet, "/track.flac", nil), identity, desc)
+	if err == nil || !strings.Contains(err.Error(), "representation differs") {
+		t.Fatalf("Serve error = %v, want same-codec size mismatch", err)
+	}
+	if !bytes.Equal(recorder.Body.Bytes(), payload[:firstChunk]) {
+		t.Fatal("bytes were appended after size mismatch")
+	}
+}
+
+func customProxy(t *testing.T, client *http.Client, resolve func(context.Context, model.TrackIdentity, source.Quality) (model.ResolvedStream, error)) (*Proxy, model.TrackIdentity) {
+	t.Helper()
+	db, err := database.Open(filepath.Join(t.TempDir(), "tunebridge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	manager, err := cache.NewAudioManager(db, t.TempDir(), 64<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy, err := NewProxy(&fakeSource{resolveFn: resolve}, source.QualityLossless, client, manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return proxy, model.TrackIdentity{SourceID: "fake-source", TrackID: "resumable-track"}
+}
+func testDescriptor(url string, size int64, codec, mime string) model.ResolvedStream {
+	return model.ResolvedStream{URL: url, Size: size, Format: model.AudioFormat{Extension: codec, Codec: codec, ContentType: mime}}
 }
 
 func TestProxy_RequestedRangeNotSatisfiable_416(t *testing.T) {

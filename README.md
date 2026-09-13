@@ -27,6 +27,7 @@ TuneBridge 是一个专为离线音乐播放器（如 OnePlayer）设计的 WebD
 | `TUNEBRIDGE_ARTWORK_CACHE_MAX_BYTES` | 否 | `1073741824` (1 GB) | 封面缓存上限字节数。 |
 | `TUNEBRIDGE_PREFERRED_QUALITY` | 否 | `lossless` | `lossless`、`exhigh`、`higher` 或 `standard`；只使用账号实际可取的表示。 |
 | `TUNEBRIDGE_LYRICS_MODE` | 否 | `original_translation` | `original`、`original_translation` 或 `original_romanized`。 |
+| `TUNEBRIDGE_COMPAT_TRACE` | 否 | `false` | 启用 200 条内存兼容性 trace；通过受认证的 `/api/debug/recent-requests` 读取。 |
 | `TUNEBRIDGE_PLAYLIST_TTL` | 否 | `5m` | 歌单元数据缓存时间。 |
 | `TUNEBRIDGE_DAILY_RECOMMENDATION_TTL` | 否 | `1h` | 每日推荐元数据缓存时间。 |
 | `TUNEBRIDGE_NETEASE_API_BASE_URL` | 否 | 无 | 用户自选或自建的 [NeteaseCloudMusicApi](https://github.com/Binaryify/NeteaseCloudMusicApi) 兼容服务绝对 URL。**无任何公共默认地址**。 |
@@ -83,6 +84,9 @@ TuneBridge 支持可选的网易云音乐扫码登录功能。该功能默认关
 
 ## 运行示例
 
+> **安全要求：** WebDAV 使用 HTTP Basic Auth。公网部署必须通过 HTTPS
+> 反向代理终止 TLS，绝不可将明文 HTTP Basic Auth 直接暴露到互联网。
+
 ### 使用 Docker Compose
 
 ```bash
@@ -95,6 +99,11 @@ export TUNEBRIDGE_WEBDAV_PASSWORD="your_password"
 
 docker compose up -d
 ```
+
+升级前先备份 `/data/tunebridge.db` 与部署环境变量/密钥。音频与封面缓存可以
+安全重建，不需要备份。升级时使用 `docker compose pull && docker compose up -d`
+（本地构建镜像则改为 `docker compose build && docker compose up -d`）；不要删除
+`tunebridge-data` volume。
 
 登录完成后，WebDAV 顶层为 `网易云`。手机搜索页是受相同 Basic Auth
 保护的 `/search`；它不会暴露网易云音频直链。

@@ -16,6 +16,7 @@ services:
       - TUNEBRIDGE_SESSION_ENCRYPTION_KEY=${TUNEBRIDGE_SESSION_ENCRYPTION_KEY:-}
       - TUNEBRIDGE_PREFERRED_QUALITY=${TUNEBRIDGE_PREFERRED_QUALITY:-lossless}
       - TUNEBRIDGE_LYRICS_MODE=${TUNEBRIDGE_LYRICS_MODE:-original_translation}
+      - TUNEBRIDGE_COMPAT_TRACE=${TUNEBRIDGE_COMPAT_TRACE:-false}
     volumes:
       - tunebridge-data:/data
     healthcheck:

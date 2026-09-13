@@ -130,10 +130,10 @@ func validateStream(stream model.ResolvedStream) error {
 }
 
 func (p *Proxy) ETag(id model.TrackIdentity, desc model.ResolvedStream) string {
-	if desc.ETag != "" {
-		return desc.ETag
-	}
-	hash := sha256.Sum256([]byte(id.String() + "\x00" + string(p.quality) + "\x00" + desc.Format.Codec + "\x00" + strconv.FormatInt(desc.Size, 10)))
+	// An upstream ETag is only one input: it may be absent, malformed, or scoped
+	// to a CDN URL. The exposed validator is always a quoted hash over the
+	// complete representation identity we can prove locally.
+	hash := sha256.Sum256([]byte(id.String() + "\x00" + string(p.quality) + "\x00" + desc.Format.Codec + "\x00" + desc.Format.ContentType + "\x00" + desc.Format.Extension + "\x00" + strconv.FormatInt(desc.Size, 10) + "\x00" + desc.ETag))
 	return `"` + hex.EncodeToString(hash[:16]) + `"`
 }
 
@@ -213,7 +213,15 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, id model.TrackIden
 	copyErr := error(nil)
 	for retry := 0; retry < 3 && written < end-start+1; retry++ {
 		if retry > 0 {
-			response, active, err = p.openWithRefresh(r.Context(), id, desc, start+written, end)
+			// A premature body EOF/reset is retryable only through a fresh provider
+			// resolution. Reusing a stale signed URL can repeatedly truncate the
+			// response and never exercises the provider's URL refresh contract.
+			refreshed, refreshErr := p.refresh(r.Context(), id, desc)
+			if refreshErr != nil {
+				copyErr = refreshErr
+				break
+			}
+			response, active, err = p.openWithRefresh(r.Context(), id, refreshed, start+written, end)
 			if err != nil {
 				copyErr = err
 				break

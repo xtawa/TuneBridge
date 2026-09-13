@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/google/uuid"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/xtawa/tunebridge/internal/api"
 	"github.com/xtawa/tunebridge/internal/auth"
+	"github.com/xtawa/tunebridge/internal/compattrace"
 	"github.com/xtawa/tunebridge/internal/config"
 	"github.com/xtawa/tunebridge/internal/webdav"
 )
@@ -28,6 +30,14 @@ func NewServer(cfg config.Config, db *sql.DB, logger *slog.Logger, neteaseLogin 
 }
 
 func NewServerWithLibrary(cfg config.Config, db *sql.DB, logger *slog.Logger, neteaseLogin *api.NeteaseLoginHandler, searchHandler *api.SearchHandler, artworkHandler *api.ArtworkHandler, library webdav.Library) *Server {
+	return newServer(cfg, db, logger, neteaseLogin, searchHandler, artworkHandler, nil, library)
+}
+
+func NewServerWithTrace(cfg config.Config, db *sql.DB, logger *slog.Logger, neteaseLogin *api.NeteaseLoginHandler, searchHandler *api.SearchHandler, artworkHandler *api.ArtworkHandler, trace *compattrace.Ring, library webdav.Library) *Server {
+	return newServer(cfg, db, logger, neteaseLogin, searchHandler, artworkHandler, trace, library)
+}
+
+func newServer(cfg config.Config, db *sql.DB, logger *slog.Logger, neteaseLogin *api.NeteaseLoginHandler, searchHandler *api.SearchHandler, artworkHandler *api.ArtworkHandler, trace *compattrace.Ring, library webdav.Library) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -49,13 +59,19 @@ func NewServerWithLibrary(cfg config.Config, db *sql.DB, logger *slog.Logger, ne
 	if artworkHandler != nil {
 		mux.Handle("GET /api/artwork/{sourceID}/{trackID}", auth.RequireBasic(http.HandlerFunc(artworkHandler.Serve), cfg.WebDAVUsername, cfg.WebDAVPassword, "TuneBridge"))
 	}
+	if trace != nil {
+		mux.Handle("GET /api/debug/recent-requests", auth.RequireBasic(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			_ = json.NewEncoder(w).Encode(map[string]any{"enabled": true, "requests": trace.Recent()})
+		}), cfg.WebDAVUsername, cfg.WebDAVPassword, "TuneBridge"))
+	}
 	if library == nil {
 		library = webdav.BootstrapLibrary()
 	}
 	mux.Handle("/", webdav.NewHandler(library, cfg.WebDAVUsername, cfg.WebDAVPassword))
 	server.http = &http.Server{
 		Addr:              cfg.ListenAddress,
-		Handler:           requestLog(logger, mux),
+		Handler:           requestLog(logger, trace, mux),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       90 * time.Second,
 	}
@@ -111,13 +127,17 @@ func (r *statusRecorder) Write(bytes []byte) (int, error) {
 	return r.ResponseWriter.Write(bytes)
 }
 
-func requestLog(logger *slog.Logger, next http.Handler) http.Handler {
+func requestLog(logger *slog.Logger, trace *compattrace.Ring, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		requestID := uuid.NewString()
 		w.Header().Set("X-Request-ID", requestID)
 		recorder := &statusRecorder{ResponseWriter: w}
 		next.ServeHTTP(recorder, r)
-		logger.Info("request", "request_id", requestID, "method", r.Method, "path", r.URL.Path, "range", r.Header.Get("Range"), "user_agent", r.UserAgent(), "status", recorder.status, "latency", time.Since(start))
+		latency := time.Since(start)
+		logger.Info("request", "request_id", requestID, "method", r.Method, "path", r.URL.Path, "status", recorder.status, "latency", latency)
+		if trace != nil {
+			trace.Add(compattrace.Entry{Timestamp: start.UTC(), RequestID: requestID, Method: r.Method, Path: r.URL.Path, UserAgent: r.UserAgent(), Depth: r.Header.Get("Depth"), Range: r.Header.Get("Range"), IfNoneMatch: r.Header.Get("If-None-Match"), IfModifiedSince: r.Header.Get("If-Modified-Since"), Status: recorder.status, ContentType: recorder.Header().Get("Content-Type"), ContentLength: recorder.Header().Get("Content-Length"), DurationMillis: latency.Milliseconds()})
+		}
 	})
 }

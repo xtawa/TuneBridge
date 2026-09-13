@@ -34,6 +34,7 @@ type Config struct {
 	DailyRecommendationTTL time.Duration
 	PreferredQuality       string
 	LyricsMode             string
+	CompatibilityTrace     bool
 }
 
 func Load(lookup LookupEnv) (Config, error) {
@@ -67,11 +68,24 @@ func Load(lookup LookupEnv) (Config, error) {
 		DailyRecommendationTTL: duration(lookup, "TUNEBRIDGE_DAILY_RECOMMENDATION_TTL", time.Hour),
 		PreferredQuality:       value(lookup, "TUNEBRIDGE_PREFERRED_QUALITY", "lossless"),
 		LyricsMode:             value(lookup, "TUNEBRIDGE_LYRICS_MODE", "original_translation"),
+		CompatibilityTrace:     boolValue(lookup, "TUNEBRIDGE_COMPAT_TRACE", false),
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func boolValue(lookup LookupEnv, key string, fallback bool) bool {
+	raw, ok := lookup(key)
+	if !ok || raw == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(raw)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 func (c Config) Validate() error {

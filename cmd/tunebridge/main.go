@@ -13,6 +13,7 @@ import (
 	"github.com/xtawa/tunebridge/internal/app"
 	"github.com/xtawa/tunebridge/internal/artwork"
 	"github.com/xtawa/tunebridge/internal/cache"
+	"github.com/xtawa/tunebridge/internal/compattrace"
 	"github.com/xtawa/tunebridge/internal/config"
 	"github.com/xtawa/tunebridge/internal/database"
 	"github.com/xtawa/tunebridge/internal/library"
@@ -92,7 +93,11 @@ func main() {
 		artworkHandler = api.NewArtworkHandler(adapter.ID(), artworkCache)
 	}
 
-	server := app.NewServerWithLibrary(cfg, db, slog.Default(), loginHandler, searchHandler, artworkHandler, davLibrary)
+	var trace *compattrace.Ring
+	if cfg.CompatibilityTrace {
+		trace = compattrace.New(200)
+	}
+	server := app.NewServerWithTrace(cfg, db, slog.Default(), loginHandler, searchHandler, artworkHandler, trace, davLibrary)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

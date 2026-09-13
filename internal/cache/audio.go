@@ -49,7 +49,68 @@ func NewAudioManager(db *sql.DB, dir string, maxBytes int64) (*Manager, error) {
 	if err := m.RemovePartials(); err != nil {
 		return nil, err
 	}
+	if err := m.Reconcile(context.Background()); err != nil {
+		return nil, err
+	}
 	return m, nil
+}
+
+// Reconcile makes startup recovery deterministic: entries that no longer have
+// a complete object are removed, and complete-looking orphan objects are
+// deleted rather than served without an index.
+func (m *Manager) Reconcile(ctx context.Context) error {
+	rows, err := m.db.QueryContext(ctx, `SELECT cache_key, local_path FROM cache_entries`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	known := make(map[string]struct{})
+	missing := make([]string, 0)
+	for rows.Next() {
+		var key, localPath string
+		if err := rows.Scan(&key, &localPath); err != nil {
+			return err
+		}
+		if !within(filepath.Join(m.dir, "objects"), localPath) {
+			missing = append(missing, key)
+			continue
+		}
+		info, statErr := os.Stat(localPath)
+		if statErr != nil || !info.Mode().IsRegular() {
+			missing = append(missing, key)
+			continue
+		}
+		known[filepath.Clean(localPath)] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, key := range missing {
+		if _, err := m.db.ExecContext(ctx, `DELETE FROM cache_entries WHERE cache_key = ?`, key); err != nil {
+			return err
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(m.dir, "objects"))
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		object := filepath.Join(m.dir, "objects", entry.Name())
+		if _, indexed := known[filepath.Clean(object)]; !indexed {
+			if err := os.Remove(object); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func within(base, candidate string) bool {
+	relative, err := filepath.Rel(base, candidate)
+	return err == nil && relative != "." && relative != "" && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && relative != ".."
 }
 
 func (m *Manager) RemovePartials() error {
